@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>remote-folder</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">Rf</div>
+        <div class="brand-text">
+          <strong>remote-folder</strong>
+        </div>
+        <button id="toggle-sidebar" type="button" title="收起连接面板" aria-expanded="true" aria-controls="session-list">‹</button>
+      </div>
+      <button id="new-session" class="primary" type="button">新建连接</button>
+      <div id="session-list"></div>
+    </aside>
+    <div id="resizer" title="拖动调整宽度"></div>
+    <main>
+      <div class="toolbar">
+        <button id="up" type="button" title="上级目录">上级</button>
+        <button id="refresh" type="button" title="刷新 (F5)">刷新</button>
+        <button id="upload" type="button">上传文件</button>
+        <button id="upload-dir" type="button">上传文件夹</button>
+        <button id="download" type="button">下载</button>
+        <button id="download-history" type="button" title="查看这个窗口里的下载记录">下载记录</button>
+        <button id="sudo-btn" type="button">sudo 查看</button>
+        <button id="open-bash" type="button" title="用系统终端打开 bash，并进入当前目录">打开 bash</button>
+      </div>
+      <div class="pathbar">
+        <div id="address-bar">
+          <div id="crumbs"></div>
+          <input id="address" type="text" spellcheck="false" placeholder="远程路径，例如 /home/user" aria-label="远程路径" hidden>
+        </div>
+        <input id="filter" type="search" placeholder="筛选当前目录" aria-label="筛选">
+      </div>
+      <div id="list-wrap">
+        <div id="welcome">
+          <h1>像使用本地磁盘一样使用远程目录</h1>
+          <p>这里只做浏览和传输，不内置文本编辑器。</p>
+          <p>双击文件会用系统里该后缀的默认程序打开，保存后写回远程。右键选「打开方式」可以换一个程序；勾选「始终使用此应用打开」后，这个后缀以后都会用它。</p>
+        </div>
+        <table id="files" hidden>
+          <thead>
+            <tr>
+              <th data-sort="name">名称</th>
+              <th data-sort="size">大小</th>
+              <th data-sort="mtime">修改时间</th>
+              <th data-sort="owner">所有者</th>
+              <th data-sort="group">用户组</th>
+              <th data-sort="mode">权限</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="overlay" hidden>请稍候…</div>
+      </div>
+      <div id="upload-bar" hidden>
+        <span id="upload-text"></span>
+        <div id="upload-meter" aria-hidden="true"><div id="upload-fill"></div></div>
+      </div>
+      <footer id="status">选择左侧连接，或新建一台主机。</footer>
+    </main>
+  </div>
+  <div id="modal" hidden>
+    <form id="modal-form">
+      <h2 id="modal-title"></h2>
+      <p id="modal-message" hidden></p>
+      <div id="modal-body"></div>
+      <div class="modal-actions">
+        <button id="modal-cancel" type="button">取消</button>
+        <button id="modal-ok" type="submit">确定</button>
+      </div>
+    </form>
+  </div>
+  <div id="menu" hidden></div>
+  <div id="toasts"></div>
+  <input id="file-input" type="file" multiple hidden>
+  <input id="dir-input" type="file" multiple hidden>
+  <script src="/static/app.js"></script>
+</body>
+</html>
