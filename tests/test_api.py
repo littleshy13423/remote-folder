@@ -354,7 +354,12 @@ def main() -> None:
                 names = [item["name"] for item in folder.json()["entries"]]
                 expect(names == ["hello.txt", "note.txt"], str(names))
                 hello = folder.json()["entries"][0]
-                expect(hello["owner"] == "0" and hello["group"] == "0", str(hello))
+                hello_stat = (root / "docs" / "hello.txt").stat()
+                expect(
+                    hello["owner"] == str(hello_stat.st_uid)
+                    and hello["group"] == str(hello_stat.st_gid),
+                    str(hello),
+                )
 
                 downloaded = request(
                     "POST",

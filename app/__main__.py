@@ -4,6 +4,7 @@ import ctypes
 import logging
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ import uvicorn
 
 from app.desktop import DesktopBridge
 from app.home import get_home, sweep_cache
-from app.main import app
+from app.main import app, resource_root
 
 
 class AppServer(uvicorn.Server):
@@ -80,6 +81,35 @@ def show_error(message: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, message, "remote-folder", 0x10)
 
 
+def configure_webview_runtime(webview) -> None:
+    """Use the runtime shipped inside the EXE, even when Windows has none installed."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    runtime = resource_root() / "webview2"
+    if not (runtime / "msedgewebview2.exe").is_file():
+        raise RuntimeError("程序内置的窗口运行时不完整，请重新下载完整的 EXE。")
+    # Fixed WebView2 v120+ uses AppContainer on Windows 10. Microsoft requires
+    # these read/execute permissions on the extracted runtime directory.
+    # https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution
+    if sys.getwindowsversion().build < 22000:
+        subprocess.run(
+            [
+                "icacls.exe",
+                str(runtime),
+                "/grant",
+                "*S-1-15-2-2:(OI)(CI)(RX)",
+                "*S-1-15-2-1:(OI)(CI)(RX)",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=60,
+        )
+    webview.settings["WEBVIEW2_RUNTIME_PATH"] = str(runtime)
+    logging.info("Using bundled WebView2 runtime: %s", runtime)
+
+
 def main() -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -103,6 +133,12 @@ def main() -> None:
             show_error("窗口组件没有随程序一起打包。")
         else:
             show_error("缺少窗口组件。请在项目目录重新运行 run.bat。")
+        raise SystemExit(1)
+
+    try:
+        configure_webview_runtime(webview)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        show_error(f"内置窗口运行时初始化失败：{exc}")
         raise SystemExit(1)
 
     sweep_cache()

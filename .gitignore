@@ -4,4 +4,4 @@ __pycache__/
 .pytest_cache/
 build/
 dist/*
-!dist/remote-folder-windows.zip
+._*
