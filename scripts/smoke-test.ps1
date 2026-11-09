@@ -90,7 +90,7 @@ try {
     if ($page.StatusCode -ne 200 -or $page.Content -notmatch '<title>remote-folder</title>') {
         throw 'The packaged HTML page is missing.'
     }
-    foreach ($asset in @('app.js', 'style.css')) {
+    foreach ($asset in @('app.js', 'file-icons.js', 'style.css')) {
         $response = Invoke-WebRequest -Uri "$baseUrl/static/$asset" -UseBasicParsing -TimeoutSec 10
         if ($response.StatusCode -ne 200 -or $response.RawContentLength -eq 0) {
             throw "The packaged static asset is missing: $asset"

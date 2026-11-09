@@ -198,8 +198,8 @@ main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #files tbody tr:hover { background: var(--hover); }
 #files tbody tr.selected { background: var(--selected); }
 .name { display: flex; align-items: center; gap: 8px; }
-.icon { width: 16px; height: 14px; flex: none; background: #8b99a4; border-radius: 2px; }
-.icon.folder { background: #c58a2a; clip-path: polygon(0 22%, 16% 22%, 26% 0, 100% 0, 100% 100%, 0 100%); }
+.file-icon { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; flex: none; color: var(--file-icon-color, #74818e); }
+.file-icon svg { display: block; width: 100%; height: 100%; }
 .badge { color: var(--muted); font-size: 12px; }
 .empty { color: var(--muted); padding: 28px 12px; }
 

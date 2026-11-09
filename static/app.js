@@ -242,8 +242,7 @@ function renderRows() {
     const name = document.createElement("td");
     const label = document.createElement("div");
     label.className = "name";
-    const icon = document.createElement("span");
-    icon.className = "icon " + (entry.isDir ? "folder" : "file");
+    const icon = FileIcons.create(entry);
     const text = document.createElement("span");
     text.textContent = entry.name;
     label.append(icon, text);
