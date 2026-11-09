@@ -16,7 +16,8 @@
 打开 [最新 Release](https://github.com/littleshy13423/remote-folder/releases/latest)，下载 **remote-folder.exe**，双击运行。
 
 - 支持 Windows 10/11 64 位（x64）。
-- 单个 EXE 已包含 Python、应用依赖和 WebView2，无需安装环境、下载源码或保留 `_internal` 文件夹。
+- 单个 EXE 已包含 Python 和应用依赖，无需安装 Python、下载源码或保留 `_internal` 文件夹。
+- 使用系统 WebView2，不把完整浏览器运行时打进 EXE。Windows 11 和绝大多数 Windows 10 设备已安装；缺少时可安装[微软 WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download)。
 - 启动时会自动解压内置组件，等待窗口出现即可。程序会打开自己的窗口，关掉窗口就退出。
 - 连接配置保存在用户目录的 `.remote-folder` 中；更新时替换 EXE 即可保留配置。
 - Release 中的 `Source code` 是给开发者的源码包，使用程序不需要下载。
@@ -31,7 +32,7 @@
 ./build.ps1
 ```
 
-脚本会准备构建环境、下载微软官方 WebView2 固定版本运行时，并生成 `dist/remote-folder.exe` 和 `dist/SHA256SUMS.txt`。这些准备工作仅在构建机器上执行，使用者只需下载最终 EXE。
+脚本会准备构建环境，并生成 `dist/remote-folder.exe` 和 `dist/SHA256SUMS.txt`。这些准备工作仅在构建机器上执行，使用者只需下载最终 EXE。
 
 ## 发布新版本
 

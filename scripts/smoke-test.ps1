@@ -50,12 +50,22 @@ try {
         $window = Get-Process -Name 'remote-folder' -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -eq $exe -and $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -eq 'remote-folder' } |
             Select-Object -First 1
-        $runtime = Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" |
-            Where-Object {
-                $_.ExecutablePath -and
-                $_.ExecutablePath.StartsWith($extractDir + '\', [StringComparison]::OrdinalIgnoreCase) -and
-                $_.ExecutablePath.EndsWith('\webview2\msedgewebview2.exe', [StringComparison]::OrdinalIgnoreCase)
-            } | Select-Object -First 1
+        # The light release uses Windows' installed WebView2. Follow the EXE's
+        # process tree so an unrelated browser cannot make this check pass.
+        $snapshot = @(Get-CimInstance Win32_Process)
+        $descendantIds = [Collections.Generic.HashSet[uint32]]::new()
+        [void]$descendantIds.Add([uint32]$process.Id)
+        do {
+            $added = $false
+            foreach ($item in $snapshot) {
+                if ($descendantIds.Contains([uint32]$item.ParentProcessId)) {
+                    if ($descendantIds.Add([uint32]$item.ProcessId)) { $added = $true }
+                }
+            }
+        } while ($added)
+        $runtime = $snapshot | Where-Object {
+            $_.Name -eq 'msedgewebview2.exe' -and $descendantIds.Contains([uint32]$_.ProcessId)
+        } | Select-Object -First 1
         # Only the page's JavaScript requests /api/sessions during this check.
         # This distinguishes a working embedded page from a blank native window.
         $pageRan = (Test-Path -LiteralPath $logPath) -and
@@ -74,7 +84,7 @@ try {
         Start-Sleep -Seconds 2
     }
     if (-not $ready) {
-        throw 'Timed out waiting for the EXE, bundled WebView2, rendered page and local API.'
+        throw ('Timed out waiting for the EXE desktop UI/API: window={0}, WebView2 child={1}, page JavaScript={2}.' -f [bool]$window, [bool]$runtime, [bool]$pageRan)
     }
     $page = Invoke-WebRequest -Uri "$baseUrl/" -UseBasicParsing -TimeoutSec 10
     if ($page.StatusCode -ne 200 -or $page.Content -notmatch '<title>remote-folder</title>') {
@@ -95,7 +105,7 @@ try {
     if ($process.ExitCode -ne 0) {
         throw "The EXE returned exit code $($process.ExitCode)."
     }
-    Write-Host 'PASS: standalone EXE starts its desktop UI, uses bundled WebView2, serves HTML/JS/CSS/API, and exits cleanly.'
+    Write-Host 'PASS: standalone EXE starts its desktop UI, uses system WebView2, serves HTML/JS/CSS/API, and exits cleanly.'
 } finally {
     if (Test-Path -LiteralPath $logPath) {
         Write-Host 'Application log:'

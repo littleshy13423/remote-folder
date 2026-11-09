@@ -4,7 +4,6 @@ import ctypes
 import logging
 import os
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -13,7 +12,7 @@ import uvicorn
 
 from app.desktop import DesktopBridge
 from app.home import get_home, sweep_cache
-from app.main import app, resource_root
+from app.main import app
 
 
 class AppServer(uvicorn.Server):
@@ -81,33 +80,15 @@ def show_error(message: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, message, "remote-folder", 0x10)
 
 
-def configure_webview_runtime(webview) -> None:
-    """Use the runtime shipped inside the EXE, even when Windows has none installed."""
-    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+def configure_windows_runtime() -> None:
+    if sys.platform != "win32":
         return
-    runtime = resource_root() / "webview2"
-    if not (runtime / "msedgewebview2.exe").is_file():
-        raise RuntimeError("程序内置的窗口运行时不完整，请重新下载完整的 EXE。")
-    # Fixed WebView2 v120+ uses AppContainer on Windows 10. Microsoft requires
-    # these read/execute permissions on the extracted runtime directory.
-    # https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution
-    if sys.getwindowsversion().build < 22000:
-        subprocess.run(
-            [
-                "icacls.exe",
-                str(runtime),
-                "/grant",
-                "*S-1-15-2-2:(OI)(CI)(RX)",
-                "*S-1-15-2-1:(OI)(CI)(RX)",
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            timeout=60,
-        )
-    webview.settings["WEBVIEW2_RUNTIME_PATH"] = str(runtime)
-    logging.info("Using bundled WebView2 runtime: %s", runtime)
+    # Use Windows' .NET Framework for WinForms. Automatic coreclr selection can
+    # find a .NET installation that does not contain the desktop assemblies.
+    os.environ["PYTHONNET_RUNTIME"] = "netfx"
+    from pythonnet import load
+
+    load("netfx")
 
 
 def main() -> None:
@@ -125,6 +106,7 @@ def main() -> None:
         encoding="utf-8",
     )
     try:
+        configure_windows_runtime()
         import webview
 
         webview.settings["ALLOW_DOWNLOADS"] = True
@@ -134,11 +116,8 @@ def main() -> None:
         else:
             show_error("缺少窗口组件。请在项目目录重新运行 run.bat。")
         raise SystemExit(1)
-
-    try:
-        configure_webview_runtime(webview)
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        show_error(f"内置窗口运行时初始化失败：{exc}")
+    except Exception as exc:
+        show_error(f"窗口组件初始化失败：{exc}")
         raise SystemExit(1)
 
     sweep_cache()
