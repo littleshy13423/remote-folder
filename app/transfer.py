@@ -18,6 +18,7 @@ from app.home import get_home
 from app.remote_path import is_directory, mode_string, parent_path, remote_join, safe_name, safe_relative
 
 
+MAX_UPLOAD_ITEMS = 5000
 LARGE_OPEN_BYTES = 32 * 1024 * 1024
 # Paramiko 默认把整个文件的读请求一次发出去。OpenSSH 大约只同时处理 64 个，超出后不再回数据，下载会一直停住。
 _READ_AHEAD = 16
@@ -327,9 +328,9 @@ def _write_sudo_password(stdin, command: str, as_root: bool, sudo_password: str 
         stdin.flush()
 
 
-def _iter_upload_tar(client, dest: str, sized, as_root: bool, sudo_password: str | None):
+def _iter_upload_tar(client, dest: str, sized, as_root: bool, sudo_password: str | None, directory_count: int):
     total = sum(item[2] for item in sized)
-    count = len(sized)
+    count = len(sized) + directory_count
     command = upload_tar_command(dest, as_root, sudo_password)
     stdin, stdout, stderr, channel = _open_tar_channel(client, command)
     sinks, threads = _drain_remote(stdout, stderr)
@@ -344,14 +345,14 @@ def _iter_upload_tar(client, dest: str, sized, as_root: bool, sudo_password: str
             "phase": "write",
             "done": 0,
             "total": total,
-            "index": 0,
+            "index": directory_count,
             "count": count,
             "name": "",
             "message": "正在打包上传…",
         }
         last_percent = -1
         with tarfile.open(fileobj=stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-            for index, (source, relative, size) in enumerate(sized, start=1):
+            for index, (source, relative, size) in enumerate(sized, start=directory_count + 1):
                 source.seek(0)
                 info = tarfile.TarInfo(name=relative)
                 info.size = size
@@ -392,13 +393,19 @@ def _iter_upload_tar(client, dest: str, sized, as_root: bool, sudo_password: str
     }
 
 
-def iter_upload(sftp, dest: str, files, relatives: list[str], client=None, as_root: bool = False, sudo_password: str | None = None):
+def iter_upload(
+    sftp, dest: str, files, relatives: list[str], client=None,
+    as_root: bool = False, sudo_password: str | None = None, *, directories: list[str] | None = None,
+):
     if len(files) != len(relatives):
         raise ValueError("上传文件和路径数量不一致")
-    if not files:
-        raise ValueError("没有选择文件")
-    if len(files) > 5000:
-        raise ValueError("一次最多上传 5000 个文件")
+    directories = directories or []
+    if not files and not directories:
+        raise ValueError("没有选择文件或目录")
+    count = len(files) + len(directories)
+    if count > MAX_UPLOAD_ITEMS:
+        raise ValueError(f"一次最多上传 {MAX_UPLOAD_ITEMS} 个项目")
+    directories = [safe_relative(path) for path in directories]
     current = sftp.normalize(dest)
     pending = list(zip(files, relatives))
     count_hint = len(pending)
@@ -413,10 +420,23 @@ def iter_upload(sftp, dest: str, files, relatives: list[str], client=None, as_ro
         source.seek(0)
         sized.append((source, safe_relative(relative), size))
         total += size
-    count = len(sized)
-    if client is not None and count >= 2:
+    directory_count = len(directories)
+    if directories:
+        file_paths = {relative for _, relative, _ in sized}
+        for directory in directories:
+            parent = directory
+            while parent:
+                if parent in file_paths:
+                    raise ValueError(f"上传的文件与目录重名：{parent}")
+                parent = posixpath.dirname(parent)
+        for index, directory in enumerate(directories, start=1):
+            _ensure_dir(sftp, remote_join(current, directory))
+            if index == 1 or index == directory_count or index % 20 == 0:
+                yield {"phase": "write", "index": index, "count": count, "done": 0, "total": total,
+                       "name": directory, "message": f"正在创建目录 {directory}"}
+    if client is not None and len(sized) >= 2:
         try:
-            yield from _iter_upload_tar(client, current, sized, as_root, sudo_password)
+            yield from _iter_upload_tar(client, current, sized, as_root, sudo_password, directory_count)
             return
         except _TarUnavailable:
             for source, _relative, _size in sized:
@@ -446,10 +466,9 @@ def iter_upload(sftp, dest: str, files, relatives: list[str], client=None, as_ro
             payload["count"] = count
         return payload
 
-    opening = emit(0, "")
-    if opening:
-        yield opening
-    for index, (source, relative, _size) in enumerate(sized, start=1):
+    if not directories:
+        yield emit(0, "")
+    for index, (source, relative, _size) in enumerate(sized, start=directory_count + 1):
         started = emit(index, relative)
         if started:
             yield started
@@ -469,7 +488,7 @@ def iter_upload(sftp, dest: str, files, relatives: list[str], client=None, as_ro
         event = emit(index, relative)
         if event:
             yield event
-    finished = emit(count, sized[-1][1] if sized else "", True)
+    finished = emit(count, sized[-1][1] if sized else directories[-1], True)
     if finished:
         yield finished
 
@@ -482,8 +501,15 @@ def _ensure_dir(sftp, path: str) -> None:
         attr = sftp.stat(path)
     except OSError:
         _ensure_dir(sftp, posixpath.dirname(path))
-        sftp.mkdir(path)
-        return
+        try:
+            sftp.mkdir(path)
+            return
+        except OSError as exc:
+            # Another upload may have created this directory since our stat.
+            try:
+                attr = sftp.stat(path)
+            except OSError:
+                raise exc
     if not stat.S_ISDIR(attr.st_mode or 0):
         raise ValueError(f"无法创建目录，因为已有同名文件：{path}")
 

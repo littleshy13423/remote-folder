@@ -636,7 +636,7 @@ function splitUploadBatches(items) {
   let batch = [];
   let bytes = 0;
   for (const item of items) {
-    const size = item.file.size || 0;
+    const size = item.file?.size || 0;
     if (batch.length && (batch.length >= 2000 || bytes + size > 32 * 1024 * 1024)) {
       batches.push(batch);
       batch = [];
@@ -703,6 +703,7 @@ async function beginUpload(collect) {
     toast("这个连接已有上传在进行，可以切换到其他连接。");
     return;
   }
+  const dest = state.path || "/";
   ensureView(sessionId).uploading = true;
   state.uploading = true;
   paintTransfer("正在读取本地文件…", 0, sessionId);
@@ -712,8 +713,10 @@ async function beginUpload(collect) {
       toast("没有可上传的文件");
       return;
     }
-    await sendUpload(sessionId, items);
-    toast(`已上传 ${items.length} 个文件`);
+    await sendUpload(sessionId, dest, items);
+    const files = items.filter((item) => item.file).length;
+    const dirs = items.length - files;
+    toast("已上传 " + [files && `${files} 个文件`, dirs && `${dirs} 个空文件夹`].filter(Boolean).join("、"));
   } catch (error) {
     showError(error);
   } finally {
@@ -737,24 +740,25 @@ async function listLocalFiles(files, sessionId = state.activeId) {
   return items;
 }
 
-async function sendUpload(sessionId, items) {
-  if (sessionId === state.activeId) rememberView();
-  const dest = ensureView(sessionId).path || "/";
-  const totalBytes = items.reduce((sum, item) => sum + (item.file.size || 0), 0);
+async function sendUpload(sessionId, dest, items) {
+  const totalBytes = items.reduce((sum, item) => sum + (item.file?.size || 0), 0);
   const batches = splitUploadBatches(items);
   let doneBytes = 0;
   let doneCount = 0;
-  paintTransfer(`正在准备上传，共 ${items.length} 个文件…`, 0, sessionId);
+  paintTransfer(`正在准备上传，共 ${items.length} 项…`, 0, sessionId);
   await yieldFrame();
   try {
     for (const batch of batches) {
-      const batchBytes = batch.reduce((sum, item) => sum + (item.file.size || 0), 0);
+      const files = batch.filter((item) => item.file);
+      const dirs = batch.filter((item) => !item.file).map((item) => item.relative);
+      const batchBytes = files.reduce((sum, item) => sum + item.file.size, 0);
       paintTransfer(`正在提交本地文件 ${doneCount}/${items.length}…`, uploadPercent(doneBytes, totalBytes, doneCount, items.length), sessionId);
       await yieldFrame();
       const form = new FormData();
       form.append("dest", dest);
-      form.append("relatives", JSON.stringify(batch.map((item) => item.relative)));
-      for (const item of batch) form.append("files", item.file, item.file.name);
+      form.append("relatives", JSON.stringify(files.map((item) => item.relative)));
+      if (dirs.length) form.append("directories", JSON.stringify(dirs));
+      for (const item of files) form.append("files", item.file, item.file.name);
       await postForm(`/api/sessions/${sessionId}/upload`, form, (event) => {
         if (!event || event.phase === "read") {
           const local = event && event.total ? Math.round((event.loaded / event.total) * 100) : 0;
@@ -781,7 +785,7 @@ async function sendUpload(sessionId, items) {
   } catch (error) {
     ensureView(sessionId).dirty = true;
     if (state.activeId === sessionId && state.path === dest) await browse(dest).catch(() => {});
-    if (doneCount) error.message = `已上传 ${doneCount} 个文件，其余没有传完。${error.message}`;
+    if (doneCount) error.message = `已上传 ${doneCount} 项，其余没有传完。${error.message}`;
     throw error;
   }
 }
@@ -1281,7 +1285,7 @@ function openDialog({ title, message = "", fields = null, build = null, okText =
   ok.classList.toggle("danger", danger);
   cancel.hidden = hideCancel;
   modal.hidden = false;
-  const first = body.querySelector("input, select");
+  const first = body.querySelector("input:not([hidden]), select, button");
   if (first) {
     first.focus();
     if (typeof first.select === "function") first.select();
@@ -1291,6 +1295,7 @@ function openDialog({ title, message = "", fields = null, build = null, okText =
       modal.hidden = true;
       state.dialogCancel = null;
       form.onsubmit = null;
+      cancel.onclick = null;
       cancel.hidden = false;
       resolve(value);
     };
@@ -1298,6 +1303,7 @@ function openDialog({ title, message = "", fields = null, build = null, okText =
     $("modal-cancel").onclick = () => finish(null);
     form.onsubmit = (event) => {
       event.preventDefault();
+      if (ok.disabled) return;
       if (!fields) {
         finish(true);
         return;
@@ -1315,6 +1321,115 @@ function openDialog({ title, message = "", fields = null, build = null, okText =
       finish(data);
     };
   });
+}
+
+async function chooseUploadFiles() {
+  const session = currentSession();
+  if (!session?.connected || state.dialogCancel) return;
+  const dest = state.path || "/";
+  const remote = new Map(state.entries.map((entry) => [entry.name, entry]));
+  const rows = [];
+  const queue = $("upload-queue-template").content.firstElementChild.cloneNode(true);
+  const list = queue.querySelector("#queue-list");
+  const all = queue.querySelector("#queue-all");
+  const overwrite = queue.querySelector("#queue-overwrite");
+  const submit = $("modal-ok");
+
+  function update() {
+    const selected = rows.filter((row) => row.check.checked);
+    const names = new Set();
+    const existing = [];
+    let conflict = "";
+    for (const { file } of selected) {
+      if (names.has(file.name)) {
+        conflict = `“${file.name}”有多个同名文件，请只勾选其中一个。`;
+        break;
+      }
+      names.add(file.name);
+      if (remote.get(file.name)?.isDir) {
+        conflict = `目标目录已有名为“${file.name}”的文件夹，请取消勾选这个文件。`;
+        break;
+      }
+      if (remote.has(file.name)) existing.push(file.name);
+    }
+    const needsOverwrite = !conflict && existing.length > 0;
+    let warning = conflict;
+    if (needsOverwrite) {
+      const preview = existing.slice(0, 3).join("、");
+      warning = `目标目录已有 ${existing.length} 个同名文件：${preview}${existing.length > 3 ? "…" : ""}`;
+    }
+    queue.querySelector("#queue-warning").textContent = warning;
+    queue.querySelector("#queue-warning").hidden = !warning;
+    queue.querySelector("#queue-overwrite-row").hidden = !needsOverwrite;
+    queue.querySelector("#queue-empty").hidden = rows.length > 0;
+    queue.querySelector("#queue-count").textContent = `已选 ${selected.length} / ${rows.length}`;
+    all.disabled = !rows.length;
+    all.checked = rows.length > 0 && rows.length === selected.length;
+    all.indeterminate = selected.length > 0 && selected.length < rows.length;
+    submit.disabled = !selected.length || Boolean(conflict) || (needsOverwrite && !overwrite.checked);
+  }
+
+  function addFiles(input, checked) {
+    const fragment = document.createDocumentFragment();
+    for (const file of input.files) {
+      const label = document.createElement("label");
+      label.className = "queue-row";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = checked;
+      const path = document.createElement("span");
+      path.textContent = file.webkitRelativePath || file.name;
+      const size = document.createElement("small");
+      size.textContent = formatSize(file.size, false);
+      label.append(check, path, size);
+      fragment.append(label);
+      rows.push({ file, check });
+    }
+    list.append(fragment);
+    input.value = "";
+    overwrite.checked = false;
+    update();
+  }
+
+  const files = queue.querySelector("#file-input");
+  const folder = queue.querySelector("#queue-folder-input");
+  queue.querySelector("#queue-add-files").onclick = () => files.click();
+  queue.querySelector("#queue-browse-folder").onclick = () => folder.click();
+  files.onchange = () => addFiles(files, true);
+  folder.onchange = () => addFiles(folder, false);
+  all.onchange = () => {
+    for (const row of rows) row.check.checked = all.checked;
+    overwrite.checked = false;
+    update();
+  };
+  list.onchange = () => { overwrite.checked = false; update(); };
+  overwrite.onchange = update;
+
+  let items;
+  $("app").inert = true;
+  try {
+    const confirmed = await openDialog({
+      title: "上传文件",
+      message: `所选文件将直接上传到 ${session.name} 的 ${dest}`,
+      okText: "确认上传",
+      build: (body) => { body.append(queue); update(); },
+    });
+    if (confirmed) {
+      items = rows.filter((row) => row.check.checked).map(({ file }) => ({ file, relative: file.name }));
+    }
+  } finally {
+    rows.length = 0;
+    queue.remove();
+    submit.disabled = false;
+    $("app").inert = false;
+    $("upload").focus();
+  }
+  if (!items?.length) return;
+  if (state.activeId !== session.id || (state.path || "/") !== dest || !currentSession()?.connected) {
+    toast("上传目标已变化，请重新选择文件。");
+    return;
+  }
+  return beginUpload(() => items);
 }
 
 function renderField(field) {
@@ -1398,43 +1513,44 @@ function readEntries(reader) {
   });
 }
 
-function walkEntry(entry, prefix, note) {
-  if (entry.isFile) {
-    return new Promise((resolve, reject) => {
-      entry.file((file) => {
-        note().then(() => resolve([{ file, relative: prefix + entry.name }]), reject);
-      }, reject);
-    });
-  }
-  return readEntries(entry.createReader()).then(async (children) => {
-    const all = [];
-    for (const child of children) all.push(...await walkEntry(child, `${prefix}${entry.name}/`, note));
-    return all;
+// The drag data store is readable only during the synchronous drop event.
+// Capture ALL roots before yielding; retaining DataTransferItem objects is not enough.
+function captureDrop(transfer) {
+  const items = Array.from(transfer.items || []).filter((item) => item.kind === "file");
+  if (!items.length) return Array.from(transfer.files || [], (file) => ({ file }));
+  return items.map((item) => {
+    const entry = item.webkitGetAsEntry?.();
+    if (entry) return { entry };
+    const file = item.getAsFile?.();
+    if (file) return { file };
+    throw new Error("无法读取拖入的项目，请重新拖入，或点击“上传文件夹”。");
   });
 }
 
-async function collectDropped(dataTransfer, sessionId = state.activeId) {
-  const items = [...dataTransfer.items];
-  if (!items.some((item) => item.webkitGetAsEntry)) {
-    return listLocalFiles(dataTransfer.files, sessionId);
-  }
-  let seen = 0;
-  const note = async () => {
-    seen += 1;
-    if (seen === 1 || seen % 40 === 0) {
-      paintTransfer(`正在读取本地文件夹，已找到 ${seen} 个文件…`, 0, sessionId);
+async function collectDropped(roots, sessionId) {
+  const items = [];
+  async function add(item) {
+    items.push(item);
+    if (items.length === 1 || items.length % 40 === 0) {
+      paintTransfer(`正在读取本地目录，已找到 ${items.length} 项…`, 0, sessionId);
       await yieldFrame();
     }
-  };
-  paintTransfer("正在读取本地文件夹…", 0, sessionId);
-  await yieldFrame();
-  const all = [];
-  for (const item of items) {
-    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
-    if (entry) all.push(...await walkEntry(entry, "", note));
   }
-  if (seen) paintTransfer(`正在读取本地文件夹，已找到 ${seen} 个文件…`, 0, sessionId);
-  return all;
+  async function walk(entry, relative) {
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      await add({ file, relative });
+      return;
+    }
+    const children = await readEntries(entry.createReader());
+    if (!children.length) await add({ relative });
+    for (const child of children) await walk(child, relative + "/" + child.name);
+  }
+  for (const { entry, file } of roots) {
+    if (entry) await walk(entry, entry.name);
+    else await add({ file, relative: file.webkitRelativePath || file.name });
+  }
+  return items;
 }
 
 const rowClick = { path: "", at: 0 };
@@ -1494,7 +1610,7 @@ function bind() {
   }, 2000);
   $("up").addEventListener("click", () => browse(state.parent || "/").catch(showError));
   $("refresh").addEventListener("click", () => browse(state.path).catch(showError));
-  $("upload").addEventListener("click", () => $("file-input").click());
+  $("upload").addEventListener("click", () => chooseUploadFiles().catch(showError));
   $("upload-dir").addEventListener("click", () => $("dir-input").click());
   $("download").addEventListener("click", () => downloadSelected().catch(showError));
   $("download-history").addEventListener("click", () => showDownloadHistory().catch(showError));
@@ -1502,16 +1618,6 @@ function bind() {
   $("sudo-btn").addEventListener("click", () => {
     const run = currentSession()?.sudo ? disableSudo() : offerSudo(false);
     run.catch(showError);
-  });
-  $("file-input").addEventListener("change", () => {
-    const input = $("file-input");
-    beginUpload(async (sessionId) => {
-      try {
-        return await listLocalFiles(input.files, sessionId);
-      } finally {
-        input.value = "";
-      }
-    });
   });
   $("dir-input").addEventListener("change", () => {
     const input = $("dir-input");
@@ -1596,7 +1702,12 @@ function bind() {
     state.dropping = false;
     wrap.classList.remove("dropping");
     if (!currentSession()?.connected) return;
-    beginUpload((sessionId) => collectDropped(event.dataTransfer, sessionId));
+    try {
+      const roots = captureDrop(event.dataTransfer);
+      beginUpload((sessionId) => collectDropped(roots, sessionId));
+    } catch (error) {
+      showError(error);
+    }
   });
   window.addEventListener("dragover", (event) => event.preventDefault());
   window.addEventListener("drop", (event) => event.preventDefault());

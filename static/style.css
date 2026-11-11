@@ -130,13 +130,13 @@ main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 }
 .toolbar { flex-wrap: wrap; }
 .pathbar { align-items: center; }
-.toolbar button, .modal-actions button, #menu button {
+.toolbar button, .modal-actions button, .queue-actions button, #menu button {
   border: 1px solid var(--line);
   background: white;
   border-radius: 8px;
   padding: 7px 10px;
 }
-.toolbar button:disabled { opacity: 0.45; cursor: default; }
+.toolbar button:disabled, .modal-actions button:disabled { opacity: 0.45; cursor: default; }
 #sudo-btn.on { background: #f8ecd6; border-color: #c58a2a; color: #6a4a12; }
 #address-bar {
   flex: 1;
@@ -255,6 +255,19 @@ main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .field-row input { flex: 1; }
 .check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.upload-queue { display: grid; gap: 10px; }
+.queue-actions, .queue-summary { display: flex; align-items: center; gap: 8px; }
+.queue-summary { justify-content: space-between; }
+.queue-summary label, #queue-overwrite-row { display: flex; align-items: center; gap: 5px; }
+#queue-count, #queue-empty, .queue-row small { color: var(--muted); }
+#queue-list { max-height: min(36vh, 320px); overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+#queue-empty { margin: 0; padding: 14px 10px; }
+.queue-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; }
+.queue-row + .queue-row { border-top: 1px solid var(--line); }
+.queue-row:hover, .queue-row:focus-within { background: var(--hover); }
+.queue-row span { flex: 1; overflow-wrap: anywhere; }
+.queue-row small { white-space: nowrap; }
+#queue-warning { margin: 0; color: var(--danger); overflow-wrap: anywhere; }
 button.danger { background: var(--danger); color: white; border-color: var(--danger); }
 .download-history { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
 .download-history-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }

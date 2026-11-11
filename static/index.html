@@ -79,7 +79,25 @@
   </div>
   <div id="menu" hidden></div>
   <div id="toasts"></div>
-  <input id="file-input" type="file" multiple hidden>
+  <template id="upload-queue-template">
+    <div class="upload-queue">
+      <div class="queue-actions">
+        <button id="queue-add-files" type="button">添加文件</button>
+        <button id="queue-browse-folder" type="button">从文件夹中挑选</button>
+        <input id="file-input" type="file" multiple hidden>
+        <input id="queue-folder-input" type="file" webkitdirectory multiple hidden>
+      </div>
+      <div class="queue-summary">
+        <label><input id="queue-all" type="checkbox"> 全选</label>
+        <span id="queue-count" aria-live="polite"></span>
+      </div>
+      <div id="queue-list" role="group" aria-label="待上传文件">
+        <p id="queue-empty">添加文件后，可在这里勾选要上传的项目。</p>
+      </div>
+      <p id="queue-warning" role="status" hidden></p>
+      <label id="queue-overwrite-row" hidden><input id="queue-overwrite" type="checkbox"> 允许覆盖选中的同名文件</label>
+    </div>
+  </template>
   <input id="dir-input" type="file" multiple hidden>
   <script src="/static/file-icons.js"></script>
   <script src="/static/app.js"></script>

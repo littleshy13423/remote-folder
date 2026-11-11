@@ -41,6 +41,16 @@ jobs:
         run: ./build.ps1 -Python python
       - name: Test packaged EXE outside the source directory
         run: ./scripts/smoke-test.ps1 -ExePath ./dist/remote-folder.exe
+      - name: Test folder drops and multi-file selection against a local SFTP server
+        run: |
+          $testEnv = Join-Path $env:RUNNER_TEMP 'folder-drop-test'
+          python -m venv --system-site-packages $testEnv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testPython = Join-Path $testEnv 'Scripts/python.exe'
+          & $testPython -m pip install playwright==1.64.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $testPython tests/test_browser_drop.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Save Windows download
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

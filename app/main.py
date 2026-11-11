@@ -425,34 +425,42 @@ def _upload_limit_message(detail: object) -> str:
     return text or "上传失败"
 
 
+def _upload_paths(raw: object) -> list[str]:
+    if not isinstance(raw, str):
+        raise APIError(400, "上传路径无效")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise APIError(400, "上传路径无效")
+    if not isinstance(parsed, list) or not all(isinstance(path, str) for path in parsed):
+        raise APIError(400, "上传路径无效")
+    if len(parsed) > transfer.MAX_UPLOAD_ITEMS:
+        raise APIError(400, f"一次最多上传 {transfer.MAX_UPLOAD_ITEMS} 个项目")
+    try:
+        return [safe_relative(path) for path in parsed]
+    except ValueError as exc:
+        raise APIError(400, str(exc))
+
+
 @app.post("/api/sessions/{session_id}/upload")
 async def upload(session_id: str, request: Request):
     session = _session_or_404(session_id)
     try:
-        form = await request.form(max_files=5000, max_fields=32, max_part_size=32 * 1024 * 1024)
+        form = await request.form(max_files=transfer.MAX_UPLOAD_ITEMS, max_fields=32, max_part_size=32 * 1024 * 1024)
     except StarletteHTTPException as exc:
         raise APIError(400, _upload_limit_message(exc.detail))
     dest = form.get("dest")
-    relatives = form.get("relatives")
+    if not isinstance(dest, str):
+        raise APIError(400, "上传路径无效")
     files = [item for item in form.getlist("files") if hasattr(item, "file")]
-    if not isinstance(dest, str) or not isinstance(relatives, str):
-        raise APIError(400, "上传路径无效")
-    try:
-        parsed = json.loads(relatives)
-    except json.JSONDecodeError:
-        raise APIError(400, "上传路径无效")
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise APIError(400, "上传路径无效")
-    try:
-        safe_paths = [safe_relative(item) for item in parsed]
-    except ValueError as exc:
-        raise APIError(400, str(exc))
+    safe_paths = _upload_paths(form.get("relatives", "[]"))
+    directories = _upload_paths(form.get("directories", "[]"))
     if len(files) != len(safe_paths):
         raise APIError(400, "上传文件和路径数量不一致")
-    if not files:
-        raise APIError(400, "没有选择文件")
-    if len(files) > 5000:
-        raise APIError(400, "一次最多上传 5000 个文件")
+    if not files and not directories:
+        raise APIError(400, "没有选择文件或目录")
+    if len(files) + len(directories) > transfer.MAX_UPLOAD_ITEMS:
+        raise APIError(400, f"一次最多上传 {transfer.MAX_UPLOAD_ITEMS} 个项目")
 
     def generate():
         events: queue.Queue = queue.Queue()
@@ -466,6 +474,7 @@ async def upload(session_id: str, request: Request):
                         dest,
                         files,
                         safe_paths,
+                        directories=directories,
                         client=link.client,
                         as_root=link.sudo,
                         sudo_password=link.sudo_password,

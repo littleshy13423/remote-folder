@@ -317,6 +317,20 @@ def main() -> None:
                     json={"parent": "/", "name": "bulk"},
                 )
                 expect(made_bulk.status_code == 200, made_bulk.text)
+                upload_url = f"/api/sessions/{session_id}/upload"
+                dirs_only = request(
+                    "POST", upload_url, data={"dest": "/bulk", "directories": json.dumps(["nested/empty"])},
+                )
+                expect(dirs_only.status_code == 200, dirs_only.text)
+                expect(json.loads(dirs_only.text.splitlines()[-1]).get("ok") is True, dirs_only.text)
+                empty = root / "bulk" / "nested" / "empty"
+                expect(empty.is_dir() and not list(empty.iterdir()), "empty directory missing or contains placeholder")
+                (empty / "keep.txt").write_bytes(b"keep")
+                for invalid in ("{}", "[false]", "not-json", '["../outside"]', json.dumps(["limit"] * 5001)):
+                    rejected = request("POST", upload_url, data={"dest": "/bulk", "directories": invalid})
+                    expect(rejected.status_code == 400, rejected.text)
+                expect(not (root / "outside").exists(), "directory escaped the upload destination")
+
                 payload = b"x" * (600 * 1024)
                 progressed = request(
                     "POST",
@@ -332,15 +346,23 @@ def main() -> None:
                     progressed.text,
                 )
                 expect((root / "bulk" / "big.bin").read_bytes() == payload, "progress upload bytes mismatch")
+                collision = request("POST", upload_url, data={"dest": "/bulk", "directories": '["big.bin"]'})
+                expect("error" in json.loads(collision.text.splitlines()[-1]), collision.text)
+                expect((root / "bulk" / "big.bin").read_bytes() == payload, "directory replaced a file")
                 many_names = [f"f{index}.txt" for index in range(1001)]
                 many = request(
                     "POST",
                     f"/api/sessions/{session_id}/upload",
-                    data={"dest": "/bulk", "relatives": json.dumps(many_names)},
+                    data={"dest": "/bulk", "relatives": json.dumps(many_names),
+                          "directories": json.dumps(["nested/empty", "nested/another"])},
                     files=[("files", (name, b"x", "text/plain")) for name in many_names],
                 )
                 expect(many.status_code == 200, many.text[:500])
                 expect((root / "bulk" / "f1000.txt").read_bytes() == b"x", "upload stopped before the last file")
+                finished = json.loads(many.text.splitlines()[-1])
+                expect(finished.get("ok") and finished["index"] == finished["count"] == 1003, str(finished))
+                expect((empty / "keep.txt").read_bytes() == b"keep", "directory merge discarded existing contents")
+                expect((root / "bulk" / "nested" / "another").is_dir(), "mixed upload omitted an empty directory")
                 expect(["tar-xf", "/bulk"] in stub.commands, str(stub.commands))
                 removed_bulk = request(
                     "POST",
