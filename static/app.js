@@ -19,6 +19,7 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+let changingElevation = false;
 
 function jsonHeaders() {
   return { "Content-Type": "application/json", "X-RF-Request": "1" };
@@ -35,6 +36,7 @@ async function api(url, options = {}) {
     const error = new Error((data && data.error) || "请求失败");
     error.status = response.status;
     error.payload = data;
+    error.sessionId = url.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
     throw error;
   }
   return data;
@@ -49,6 +51,13 @@ function toast(message) {
 }
 
 function showError(error) {
+  if (error?.payload?.permissionDenied && error.sessionId === state.activeId &&
+      !error.elevationOffered && !currentSession()?.sudo && !state.dialogCancel && !changingElevation) {
+    offerElevation(true).then((enabled) => {
+      if (enabled) toast("已提升权限，可以重新执行刚才的操作。");
+    }).catch((failure) => toast(failure.message));
+    return;
+  }
   toast(error && error.message ? error.message : String(error));
 }
 
@@ -269,6 +278,17 @@ function renderRows() {
   wrap.scrollTop = scroll;
 }
 
+let crumbNavigationTimer;
+let doubleClickTime = 500;
+window.addEventListener("pywebviewready", async () => {
+  try {
+    const delay = await window.pywebview.api.double_click_time_ms();
+    if (delay > 0) doubleClickTime = delay;
+  } catch {
+    // Keep the browser default if the desktop bridge is unavailable.
+  }
+}, { once: true });
+
 function renderCrumbs() {
   const box = $("crumbs");
   box.replaceChildren();
@@ -292,10 +312,7 @@ function renderCrumbs() {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = item.name;
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      browse(item.path).catch(showError);
-    });
+    button.dataset.path = item.path;
     box.append(button);
   });
 }
@@ -306,13 +323,15 @@ function syncAddress() {
 }
 
 function beginAddressEdit() {
+  clearTimeout(crumbNavigationTimer);
   if (!currentSession()?.connected || state.busy) return;
   const input = $("address");
+  if (!input.hidden) return;
   input.value = state.path || "/";
   input.hidden = false;
   $("address-bar").classList.add("editing");
   input.focus();
-  setTimeout(() => input.select(), 0);
+  input.select();
 }
 
 function endAddressEdit(commit) {
@@ -333,9 +352,12 @@ function renderChrome() {
   $("upload").disabled = !connected || state.busy || state.uploading;
   $("upload-dir").disabled = !connected || state.busy || state.uploading;
   $("download").disabled = !connected || !selected || state.busy || state.downloading;
-  $("sudo-btn").disabled = !connected || state.busy;
-  $("sudo-btn").classList.toggle("on", Boolean(currentSession()?.sudo));
-  $("sudo-btn").textContent = currentSession()?.sudo ? "关闭 sudo" : "sudo 查看";
+  const session = currentSession();
+  const elevated = connected && session.sudo;
+  const mode = session?.elevationMethod === "su" ? "su root" : "sudo";
+  $("sudo-btn").disabled = !connected || state.busy || changingElevation;
+  $("sudo-btn").classList.toggle("on", Boolean(elevated));
+  $("sudo-btn").textContent = elevated ? `关闭 ${mode}` : "提升权限";
   $("open-bash").disabled = !connected || state.busy || !state.path;
   $("up").disabled = !connected || !state.path || state.path === "/" || state.busy;
   $("overlay").hidden = !state.busy;
@@ -351,7 +373,7 @@ function renderChrome() {
   if (!connected) status.textContent = "选择左侧连接，或新建一台主机。";
   else if (state.busy) status.textContent = state.busyMessage || "请稍候…";
   else {
-    const prefix = currentSession()?.sudo ? "sudo 查看 · " : "";
+    const prefix = elevated ? `root（${mode}） · ` : "";
     status.textContent = prefix + (selected ? `${visibleEntries().length} 项，已选 ${selected} 项` : `${visibleEntries().length} 项`);
   }
   document.querySelectorAll("#files th").forEach((th) => {
@@ -406,6 +428,7 @@ function sleep(ms, signal) {
 }
 
 async function loadDirectory(path) {
+  clearTimeout(crumbNavigationTimer);
   const sessionId = state.activeId;
   if (!sessionId) return;
   const token = ++sizeToken;
@@ -475,74 +498,109 @@ function paintFolderSize(entry) {
 }
 
 async function browse(path) {
+  const sessionId = state.activeId;
   try {
     await loadDirectory(path);
   } catch (error) {
-    if (!(error.payload && error.payload.permissionDenied)) throw error;
-    const elevated = await offerSudo(true);
-    if (!elevated) throw error;
+    if (!error.payload?.permissionDenied || state.activeId !== sessionId || currentSession()?.sudo) throw error;
+    error.elevationOffered = true;
+    const elevated = await offerElevation(true);
+    if (!elevated || state.activeId !== sessionId) throw error;
     await loadDirectory(path);
   }
 }
 
-async function requestSudo(password, remember) {
-  const data = await api(`/api/sessions/${state.activeId}/sudo`, {
+async function setElevation(sessionId, settings) {
+  const result = await api(`/api/sessions/${sessionId}/sudo`, {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ password: password || "", remember: Boolean(remember), enable: true }),
+    body: JSON.stringify(settings),
   });
-  const session = currentSession();
-  if (session) session.sudo = true;
+  const session = state.sessions.find((item) => item.id === sessionId);
+  if (session) {
+    session.sudo = result.sudo;
+    session.elevationMethod = result.elevationMethod;
+  }
   renderChrome();
-  toast(data.message || "已使用 sudo 查看");
+  if (result.message) toast(result.message);
+  return result.sudo;
 }
 
-async function offerSudo(becauseDenied) {
-  if (currentSession()?.sudo) return true;
-  try {
-    await requestSudo("", false);
-    return true;
-  } catch (error) {
-    if (!(error.payload && error.payload.sudoPassword)) throw error;
-  }
-  while (true) {
-    const form = await openDialog({
-      title: "sudo 密码",
-      message: becauseDenied
-        ? "当前账号打不开这个目录。输入 sudo 密码后，会用管理员身份查看和操作，直到关闭 sudo 查看。"
-        : "输入 sudo 密码后，会用管理员身份查看和操作，直到关闭 sudo 查看。",
-      fields: [
-        { name: "password", label: "sudo 密码", type: "password", required: true },
-        { name: "remember", label: "记住，下次不用再输入", type: "checkbox", checked: true },
-      ],
-      okText: "sudo 查看",
-    });
-    if (!form) return false;
-    try {
-      await requestSudo(form.password, form.remember);
-      return true;
-    } catch (error) {
-      if (!(error.payload && error.payload.sudoPassword)) throw error;
-      toast(error.message || "sudo 密码不正确");
-    }
-  }
-}
-
-async function disableSudo() {
-  await api(`/api/sessions/${state.activeId}/sudo`, {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify({ enable: false }),
-  });
+async function offerElevation(becauseDenied) {
   const session = currentSession();
-  if (session) session.sudo = false;
+  if (!session?.connected || changingElevation || state.dialogCancel) return false;
+  if (session.sudo) return true;
+  changingElevation = true;
+  $("app").inert = true;
+  renderChrome();
+  let method = "sudo";
+  let reason = becauseDenied ? "当前权限不足。" : "";
   try {
-    await loadDirectory(state.path || "");
-  } catch (error) {
-    if (error.payload && error.payload.permissionDenied) await loadDirectory("");
-    else throw error;
+    while (state.activeId === session.id && currentSession()?.connected) {
+      const form = await openDialog({
+        title: "提升权限",
+        message: `${reason}在 ${session.username}@${session.host} 的当前 SSH 连接中以 root 身份操作。`,
+        fields: [
+          { name: "method", label: "提权方式", type: "select", value: method,
+            options: [["sudo", "sudo · 使用当前账号"], ["su", "su root · 使用 root 密码"]] },
+          { name: "password", label: "当前账号的 sudo 密码", type: "password" },
+          { name: "remember", label: "记住 sudo 密码", type: "checkbox" },
+        ],
+        build() {
+          const inputs = $("modal-form").elements;
+          const picker = inputs.namedItem("method");
+          const password = inputs.namedItem("password");
+          const remember = inputs.namedItem("remember");
+          function selectMethod() {
+            const su = picker.value === "su";
+            password.value = "";
+            password.required = su;
+            password.placeholder = su ? "输入 root 密码" : "免密 sudo 或密码已保存时可留空";
+            password.labels[0].textContent = su ? "root 密码" : "当前账号的 sudo 密码";
+            remember.checked = false;
+            remember.closest("label").hidden = su;
+          }
+          picker.onchange = selectMethod;
+          selectMethod();
+        },
+        okText: "提升权限",
+      });
+      if (!form || state.activeId !== session.id || !currentSession()?.connected) return false;
+      method = form.method;
+      try {
+        return await setElevation(session.id, {
+          enable: true, method, password: form.password, remember: method === "sudo" && form.remember,
+        });
+      } catch (error) {
+        if (!(error.payload?.sudoPassword || error.status === 400 || error.status === 403)) throw error;
+        reason = `${error.message}。请选择其他方式或重新输入密码。`;
+      }
+    }
+    return false;
+  } finally {
+    $("app").inert = false;
+    changingElevation = false;
+    renderChrome();
   }
-  toast("已关闭 sudo 查看");
+}
+
+async function disableElevation() {
+  const sessionId = state.activeId;
+  changingElevation = true;
+  renderChrome();
+  try {
+    await setElevation(sessionId, { enable: false });
+    if (state.activeId !== sessionId) return;
+    try {
+      await loadDirectory(state.path || "");
+    } catch (error) {
+      if (error.payload?.permissionDenied && state.activeId === sessionId) await loadDirectory("");
+      else throw error;
+    }
+  } finally {
+    changingElevation = false;
+    renderChrome();
+  }
 }
 
 async function connectSession(id, extra = {}) {
@@ -621,7 +679,11 @@ async function openSession(id, options = {}) {
   await busy("正在连接…", async () => {
     await connectSession(id);
     const session = state.sessions.find((item) => item.id === id);
-    if (session) session.connected = true;
+    if (session) {
+      session.connected = true;
+      session.sudo = false;
+      session.elevationMethod = null;
+    }
     try {
       await browse(session && session.lastPath ? session.lastPath : "");
     } catch (error) {
@@ -831,6 +893,7 @@ function postForm(url, form, onProgress) {
       else {
         const error = new Error(detail || "上传失败");
         error.payload = data;
+        error.sessionId = url.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
         reject(error);
       }
     };
@@ -1161,6 +1224,8 @@ function sessionMenu(session) {
       label: "断开",
       run: () => api(`/api/sessions/${session.id}/disconnect`, { method: "POST" }).then(async () => {
         session.connected = false;
+        session.sudo = false;
+        session.elevationMethod = null;
         views.delete(session.id);
         if (state.activeId === session.id) {
           state.path = "";
@@ -1292,6 +1357,7 @@ function openDialog({ title, message = "", fields = null, build = null, okText =
   }
   return new Promise((resolve) => {
     const finish = (value) => {
+      for (const secret of body.querySelectorAll('input[type="password"]')) secret.value = "";
       modal.hidden = true;
       state.dialogCancel = null;
       form.onsubmit = null;
@@ -1470,6 +1536,8 @@ function renderField(field) {
     input.placeholder = field.placeholder || "";
   }
   input.name = field.name;
+  input.id = `modal-field-${field.name}`;
+  label.htmlFor = input.id;
   input.autocomplete = "off";
   row.append(input);
   if (field.browse) {
@@ -1616,7 +1684,7 @@ function bind() {
   $("download-history").addEventListener("click", () => showDownloadHistory().catch(showError));
   $("open-bash").addEventListener("click", () => openBash(state.path).catch(showError));
   $("sudo-btn").addEventListener("click", () => {
-    const run = currentSession()?.sudo ? disableSudo() : offerSudo(false);
+    const run = currentSession()?.sudo ? disableElevation() : offerElevation(false);
     run.catch(showError);
   });
   $("dir-input").addEventListener("change", () => {
@@ -1629,8 +1697,28 @@ function bind() {
       }
     });
   });
+  $("address-bar").addEventListener("mousedown", (event) => {
+    if (event.detail === 2) clearTimeout(crumbNavigationTimer);
+  });
   $("address-bar").addEventListener("click", (event) => {
-    if (event.target.closest("button")) return;
+    if (event.target === $("address")) return;
+    clearTimeout(crumbNavigationTimer);
+    const crumb = event.target.closest("button[data-path]");
+    if (!crumb) return beginAddressEdit();
+    const path = crumb.dataset.path;
+    if (event.detail === 0) return browse(path).catch(showError); // Keyboard activation
+    if (event.detail > 1) return;
+    const sessionId = state.activeId;
+    // Keep the current path visible while a second click can still turn this into an edit.
+    crumbNavigationTimer = setTimeout(() => {
+      if (sessionId === state.activeId && currentSession()?.connected && $("address").hidden) {
+        browse(path).catch(showError);
+      }
+    }, doubleClickTime);
+  });
+  $("address-bar").addEventListener("dblclick", (event) => {
+    if (event.target === $("address")) return;
+    event.preventDefault();
     beginAddressEdit();
   });
   $("address").addEventListener("keydown", (event) => {
@@ -1720,7 +1808,7 @@ function bind() {
       hideMenu();
       return;
     }
-    if (state.dialogCancel || isTyping(event.target) || !currentSession()?.connected) return;
+    if (state.dialogCancel || changingElevation || isTyping(event.target) || !currentSession()?.connected) return;
     if (event.key === "F5") {
       event.preventDefault();
       browse(state.path).catch(showError);

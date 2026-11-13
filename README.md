@@ -21,6 +21,8 @@
 
 文件管理与传输不依赖外部 SSH 程序；可选的「打开 bash」功能使用 Windows 的 OpenSSH 客户端，系统未安装该可选组件时会提示。
 
+需要管理受限目录时，点击「提升权限」。平时使用 `su` 切换到 root 的用户，选择「su root」并输入 root 密码，即可在当前 SSH 连接中以 root 浏览和传输文件。操作完成后点击关闭提权，返回原账号。此方式要求 Linux 服务器允许该账号通过非交互终端的 su 密码认证，并已安装独立的 OpenSSH sftp-server。使用 sudo 的用户可以选择 sudo，服务器配置了免密 sudo 时可留空密码。
+
 ## 开发与打包
 
 开发时在 Windows 上双击 `run.bat`。本地打包需要 Windows 和 Python 3.11 x64，在 PowerShell 中运行：

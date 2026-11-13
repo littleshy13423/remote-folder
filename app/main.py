@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -67,6 +68,7 @@ class ConnectBody(BaseModel):
 
 
 class SudoBody(BaseModel):
+    method: Literal["sudo", "su"] = "sudo"
     password: str | None = None
     remember: bool = True
     enable: bool = True
@@ -126,7 +128,8 @@ def _session_or_404(session_id: str) -> dict:
 
 def _public(session: dict) -> dict:
     data = store.public_session(session, pool.connected(session["id"]))
-    data["sudo"] = pool.sudo_enabled(session["id"])
+    data["elevationMethod"] = pool.elevation_method(session["id"])
+    data["sudo"] = data["elevationMethod"] is not None
     return data
 
 
@@ -311,15 +314,17 @@ def set_sudo(session_id: str, body: SudoBody):
     if not body.enable:
         try:
             pool.disable_sudo(session_id)
-        except NotConnected:
+        except (NotConnected, ConnectionDropped):
             raise APIError(409, "还没有连接这台主机", needConnect=True)
-        return {"ok": True, "sudo": False, "message": "已关闭 sudo 查看"}
-    password = body.password or store.get_secret(session_id, "sudo")
-    if not password:
-        raise APIError(401, "需要 sudo 密码", sudoPassword=True)
+        return {"ok": True, "sudo": False, "elevationMethod": None, "message": "已返回登录账号"}
+    password = body.password or ""
+    if body.method == "su" and not password:
+        raise APIError(401, "请输入 root 密码", sudoPassword=True)
+    if body.method == "sudo" and not password:
+        password = store.get_secret(session_id, "sudo") or ""
     try:
-        pool.enable_sudo(session_id, password)
-    except NotConnected:
+        pool.enable_sudo(session_id, password, method=body.method)
+    except (NotConnected, ConnectionDropped):
         raise APIError(409, "还没有连接这台主机", needConnect=True)
     except AuthFailed as exc:
         raise APIError(401, str(exc), sudoPassword=True)
@@ -327,12 +332,12 @@ def set_sudo(session_id: str, body: SudoBody):
         raise APIError(400, str(exc))
     except ValueError as exc:
         raise APIError(400, str(exc))
-    if body.password:
+    if body.method == "sudo" and body.password:
         if body.remember:
             store.set_secret(session_id, "sudo", body.password)
         else:
             store.delete_secret(session_id, "sudo")
-    return {"ok": True, "sudo": True, "message": "已使用 sudo 查看"}
+    return {"ok": True, "sudo": True, "elevationMethod": body.method, "message": "已启用管理员文件操作"}
 
 
 @app.post("/api/sessions/{session_id}/install-key")
@@ -340,7 +345,7 @@ def install_key(session_id: str):
     _session_or_404(session_id)
     try:
         private, line = keys.ensure_key()
-        installed = _run(session_id, lambda live: keys.install_public_key(live.sftp, live.home, line))
+        installed = _run(session_id, lambda live: keys.install_public_key(live.user_sftp, live.home, line))
         session = store.use_key_auth(session_id, str(private))
     except KeyError:
         raise APIError(404, "连接不存在")
@@ -408,8 +413,8 @@ def delete(session_id: str, body: PathsBody):
         return transfer.delete_paths(
             live.sftp,
             body.paths,
-            client=live.client,
-            as_root=live.sudo_sftp is not None,
+            client=None if live.elevation_method == "su" else live.client,
+            as_root=live.elevation_method == "sudo",
             sudo_password=live.sudo_password,
         )
 

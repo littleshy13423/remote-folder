@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import secrets
 import socket
 import time
 
@@ -58,7 +59,7 @@ def find_sftp_server(client: paramiko.SSHClient) -> str:
     except (socket.timeout, TimeoutError, paramiko.SSHException, OSError) as exc:
         raise ConnectionError(f"无法查找 sftp-server：{exc}") from exc
     if code != 0:
-        raise ConnectionError("这台主机上没有找到 sftp-server，无法用 sudo 查看")
+        raise ConnectionError("这台主机上没有找到独立的 sftp-server，无法启动管理员文件服务")
     path = match_sftp_server(found)
     if path is None:
         raise ConnectionError("这台主机上没有找到可用的 sftp-server")
@@ -188,12 +189,73 @@ def _start_sftp_with_password(transport: paramiko.Transport, server: str, passwo
 def open_sftp(client: paramiko.SSHClient, server: str, password: str) -> paramiko.SFTPClient:
     if match_sftp_server(server) is None:
         raise ValueError("sftp-server 路径无效")
-    if not password:
-        raise ValueError("sudo 密码无效")
     transport = client.get_transport()
     if transport is None or not transport.is_active():
         raise ConnectionError("连接已断开")
     try:
         return _start_sftp(transport, server)
     except _SudoNeedsPassword:
+        if not password:
+            raise PermissionError("这台主机的 sudo 需要密码")
         return _start_sftp_with_password(transport, server, password)
+
+
+def open_su_sftp(client: paramiko.SSHClient, server: str, password: str) -> paramiko.SFTPClient:
+    """Authenticate to su on the current SSH transport, then use its binary SFTP stream."""
+    if server not in SFTP_SERVERS:
+        raise ValueError("sftp-server 路径无效")
+    if not password or any(char in password for char in ("\r", "\n", "\0")):
+        raise ValueError("请填写有效的 root 密码")
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise ConnectionError("连接已断开")
+    ready = "RF_SFTP_" + secrets.token_hex(16)
+    # su and PAM exchange authentication on stdin/stderr. Leave stdout untouched
+    # for SFTP, and send no binary packets until the privileged shell is ready.
+    command = (
+        "PATH=/usr/bin:/bin LC_ALL=C su -s /bin/sh -c "
+        f"""'test "$(/usr/bin/id -u)" = 0 && echo {ready} >&2 && exec {server}' root"""
+    )
+    channel = transport.open_session(timeout=20)
+    opened = False
+    try:
+        channel.settimeout(20)
+        channel.exec_command(command)
+        sent = False
+        pending = b""
+        deadline = time.monotonic() + 20
+        marker = ready.encode("ascii") + b"\n"
+        while marker not in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError("su 认证超时。请检查服务器是否要求交互终端或额外认证。")
+            channel.settimeout(remaining)
+            chunk = channel.recv_stderr(4096)
+            if not chunk:
+                lower = pending.lower()
+                if b"terminal" in lower or b"tty" in lower:
+                    raise ConnectionError("这台主机的 su 要求交互终端，文件窗口无法完成认证")
+                if b"not found" in lower:
+                    raise ConnectionError("远端缺少 su 或所需的文件服务程序")
+                raise PermissionError("su 认证失败，请检查 root 密码和当前账号的 su 权限")
+            pending += chunk
+            if len(pending) > 16384:
+                raise ConnectionError("su 返回了无法识别的认证提示")
+            if pending.rstrip().endswith(b"Password:"):
+                if sent:
+                    raise PermissionError("su 未接受本次 root 认证")
+                channel.sendall((password + "\n").encode("utf-8"))
+                pending = b""
+                sent = True
+        channel.settimeout(20)
+        sftp = paramiko.SFTPClient(channel)
+        channel.settimeout(None)
+        opened = True
+        return sftp
+    except socket.timeout as exc:
+        raise ConnectionError("su 文件服务超时。请检查服务器是否要求交互终端或额外认证。") from exc
+    except (paramiko.SSHException, EOFError) as exc:
+        raise ConnectionError("远端未能启动 su 文件服务") from exc
+    finally:
+        if not opened:
+            _close_channel(channel)

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ctypes
+
 from app import downloads
 
 
 class DesktopBridge:
     def __init__(self) -> None:
         self._window = None
+
+    def double_click_time_ms(self) -> int:
+        return ctypes.windll.user32.GetDoubleClickTime()
 
     def show_download_history(self) -> dict:
         window = self._window

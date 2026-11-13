@@ -107,6 +107,68 @@ def verify_upload_queue(page, source, dest):
         assert (dest / path.name).read_bytes() == path.read_bytes(), path.name
 
 
+def verify_path_bar(page, remote):
+    from playwright.sync_api import expect
+
+    parts = ['target', 'deep-ancestor-directory', '中间目录-' + 'a' * 32, 'b' * 35, 'leaf-folder']
+    remote.joinpath(*parts).mkdir(parents=True)
+    full_path = '/' + '/'.join(parts)
+    bar, crumbs, address = page.locator('#address-bar'), page.locator('#crumbs'), page.locator('#address')
+    leaf = crumbs.get_by_role('button', name=parts[-1], exact=True)
+    ancestor = crumbs.get_by_role('button', name=parts[1], exact=True)
+
+    def type_path(path):
+        # Use the blank left padding of the address bar rather than a breadcrumb.
+        bar.click(position={'x': 2, 'y': 10})
+        expect(address).to_be_focused()
+        address.fill(path)
+        address.press('Enter')
+        expect(address).to_be_hidden()
+
+    type_path(full_path)
+    expect(leaf).to_be_visible()
+    list_requests = []
+
+    def record_listing(request):
+        if request.url.split('?', 1)[0].endswith('/list'):
+            list_requests.append(request.url)
+
+    page.on('request', record_listing)
+    try:
+        for segment in (ancestor, leaf):
+            # A real dblclick sends a first click before the second click/dblclick.
+            segment.dblclick(delay=80)
+            expect(address).to_be_focused()
+            expect(address).to_have_value(full_path)
+            page.wait_for_function("""() => { const el = document.querySelector('#address');
+                return el.selectionStart === 0 && el.selectionEnd === el.value.length; }""")
+            address.fill('/target')
+            address.press('Escape')
+            expect(address).to_be_hidden()
+            expect(leaf).to_be_visible()
+        # Let the single-click grace period elapse before checking for a stray request.
+        page.wait_for_timeout(750)
+        assert not list_requests, f'Double-click or Escape unexpectedly navigated: {list_requests}'
+
+        with page.expect_response(lambda response: response.url.split('?', 1)[0].endswith('/list')) as listing:
+            leaf.click()
+        assert listing.value.json()['path'] == full_path
+        expect(address).to_be_hidden()
+        ancestor.click()
+        expect(crumbs.get_by_role('button').last).to_have_text(parts[1])
+        expect(address).to_be_hidden()
+        expect(page.locator('#rows tr').filter(has_text=parts[2])).to_be_visible()
+        type_path(full_path)
+        expect(leaf).to_be_visible()
+        target = crumbs.get_by_role('button', name='target', exact=True)
+        target.focus()
+        target.press('Enter')
+        expect(crumbs.get_by_role('button').last).to_have_text('target')
+        expect(page.locator('#rows tr').filter(has_text=parts[1])).to_be_visible()
+    finally:
+        page.remove_listener('request', record_listing)
+
+
 def test_browser_drop():
     from playwright.sync_api import sync_playwright
 
@@ -160,8 +222,9 @@ def test_browser_drop():
             if path.is_file():
                 assert uploaded.read_bytes() == path.read_bytes(), path
         verify_upload_queue(page, temp / 'picker', dest)
+        verify_path_bar(page, remote)
 
 
 if __name__ == '__main__':
     test_browser_drop()
-    print('PASS: Chrome preserved the dropped tree and uploaded only checked files from the picker.')
+    print('PASS: Chrome verified folder drops, upload selection, and path-bar navigation and editing.')

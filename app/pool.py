@@ -4,7 +4,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import paramiko
@@ -47,52 +47,63 @@ class Live:
     user_sftp: paramiko.SFTPClient
     home: str
     lock: threading.Lock
-    auth: str = "password"
-    password: str | None = None
-    passphrase: str | None = None
-    key_path: str = ""
-    sudo_password: str | None = None
-    sudo_sftp: paramiko.SFTPClient | None = None
+    login: dict = field(repr=False)
+    password: str | None = field(default=None, repr=False)
+    passphrase: str | None = field(default=None, repr=False)
+    sudo_password: str | None = field(default=None, repr=False)
+    elevation_method: str | None = None
+    transfer_link: TransferLink | None = None
     closed: bool = False
     waiters: int = 0
     size_gen: int = 0
 
+    def reset_elevation(self) -> None:
+        # Invalidate the cached link before exposing the new identity.
+        if self.transfer_link is not None:
+            self.transfer_link.close()
+            self.transfer_link = None
+        if self.sftp is not self.user_sftp:
+            _close(self.sftp)
+        self.sftp = self.user_sftp
+        self.elevation_method = None
+        self.sudo_password = None
+        self.size_gen += 1
+
     def close(self) -> None:
         self.closed = True
-        seen: set[int] = set()
-        for item in (self.sudo_sftp, self.user_sftp, self.sftp):
-            if item is None or id(item) in seen:
-                continue
-            seen.add(id(item))
-            try:
-                item.close()
-            except Exception:
-                pass
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self.reset_elevation()
+        self.password = self.passphrase = None
+        _close(self.user_sftp)
+        _close(self.client)
 
 
 @dataclass
 class TransferLink:
-    client: paramiko.SSHClient
+    # A su transfer borrows the authenticated SFTP channel and has no SSH client.
+    client: paramiko.SSHClient | None
     sftp: paramiko.SFTPClient
     lock: threading.Lock
-    sudo: bool = False
-    sudo_password: str | None = None
+    elevation_method: str | None = None
+    sudo_password: str | None = field(default=None, repr=False)
     closed: bool = False
+
+    @property
+    def sudo(self) -> bool:
+        return self.elevation_method == "sudo"
 
     def close(self) -> None:
         self.closed = True
-        try:
-            self.sftp.close()
-        except Exception:
-            pass
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self.sudo_password = None
+        if self.client is not None:
+            _close(self.sftp)
+            _close(self.client)
+
+
+def _close(resource) -> None:
+    try:
+        resource.close()
+    except Exception:
+        pass
 
 
 def dial(session: dict, password: str | None, passphrase: str | None, trust_host: bool) -> tuple[paramiko.SSHClient, paramiko.SFTPClient, str]:
@@ -170,8 +181,6 @@ class Pool:
     def __init__(self) -> None:
         self._guard = threading.Lock()
         self._lives: dict[str, Live] = {}
-        self._transfers: dict[str, TransferLink] = {}
-        self._transfer_setup = threading.Lock()
 
     def connected(self, session_id: str) -> bool:
         with self._guard:
@@ -179,7 +188,6 @@ class Pool:
             return live is not None and not live.closed
 
     def disconnect(self, session_id: str) -> None:
-        self._discard_transfer(session_id)
         with self._guard:
             live = self._lives.pop(session_id, None)
         if live is not None:
@@ -187,7 +195,6 @@ class Pool:
                 live.close()
 
     def connect(self, session: dict, password: str | None, passphrase: str | None, trust_host: bool) -> str:
-        self._discard_transfer(session["id"])
         auth = session.get("auth") or "password"
         client, sftp, home = dial(session, password, passphrase, trust_host)
         live = Live(
@@ -196,10 +203,9 @@ class Pool:
             user_sftp=sftp,
             home=home,
             lock=threading.Lock(),
-            auth=auth,
+            login={key: session[key] for key in ("host", "port", "username", "keyPath", "auth") if key in session},
             password=password if auth == "password" else None,
             passphrase=passphrase if auth == "key" else None,
-            key_path=session.get("keyPath") or "",
         )
         with self._guard:
             old = self._lives.pop(session["id"], None)
@@ -222,11 +228,23 @@ class Pool:
             with live.lock:
                 acquired = True
                 live.waiters -= 1
-                if live.closed:
-                    raise NotConnected()
+                with self._guard:
+                    if self._lives.get(session_id) is not live or live.closed:
+                        raise NotConnected()
                 try:
+                    transport = live.client.get_transport()
+                    if transport is None or not transport.is_active():
+                        raise EOFError("SSH 连接已断开")
                     yield live
-                except (paramiko.SSHException, EOFError) as exc:
+                except (paramiko.SSHException, EOFError, OSError) as exc:
+                    transport = live.client.get_transport()
+                    active = transport is not None and transport.is_active()
+                    if isinstance(exc, OSError) and active and not live.sftp.get_channel().closed:
+                        raise
+                    if active and live.elevation_method is not None:
+                        live.reset_elevation()
+                        transfer.clear_folder_sizes(session_id)
+                        raise ConnectionError("管理员文件通道已关闭，已返回登录账号") from exc
                     live.close()
                     dropped = exc
         finally:
@@ -273,141 +291,86 @@ class Pool:
             live = self._lives.get(session_id)
             return live is not None and not live.closed and live.size_gen == generation
 
-    def sudo_enabled(self, session_id: str) -> bool:
+    def elevation_method(self, session_id: str) -> str | None:
         with self._guard:
             live = self._lives.get(session_id)
-            return live is not None and not live.closed and live.sudo_sftp is not None
+            if live is not None and not live.closed:
+                transport = live.client.get_transport()
+                if transport is not None and transport.is_active() and not live.sftp.get_channel().closed:
+                    return live.elevation_method
+        return None
 
-    def enable_sudo(self, session_id: str, password: str) -> None:
-        with self._guard:
-            live = self._lives.get(session_id)
-        if live is None or live.closed:
-            raise NotConnected()
-        with live.lock:
-            if live.closed:
-                raise NotConnected()
+    def sudo_enabled(self, session_id: str) -> bool:
+        return self.elevation_method(session_id) is not None
+
+    def enable_sudo(self, session_id: str, password: str, method: str = "sudo") -> None:
+        if method not in ("sudo", "su"):
+            raise ValueError("未知的管理员认证方式")
+        if method == "su" and not password:
+            raise ValueError("请输入 root 密码")
+        with self.session(session_id) as live:
             try:
                 server = sudo_access.find_sftp_server(live.client)
-                opened = sudo_access.open_sftp(live.client, server, password)
-            except ValueError:
-                raise
+                if method == "su":
+                    opened = sudo_access.open_su_sftp(live.client, server, password)
+                else:
+                    opened = sudo_access.open_sftp(live.client, server, password)
             except PermissionError as exc:
                 raise AuthFailed(str(exc)) from exc
             except ConnectionError as exc:
                 raise ConnectionFailed(str(exc)) from exc
-            if live.sudo_sftp is not None:
-                try:
-                    live.sudo_sftp.close()
-                except Exception:
-                    pass
-            live.sudo_sftp = opened
+            live.reset_elevation()
             live.sftp = opened
-            live.sudo_password = password
-        self._discard_transfer(session_id)
+            live.sudo_password = password if method == "sudo" else None
+            live.elevation_method = method
+            transfer.clear_folder_sizes(session_id)
 
     def disable_sudo(self, session_id: str) -> None:
-        with self._guard:
-            live = self._lives.get(session_id)
-        if live is None or live.closed:
-            raise NotConnected()
-        with live.lock:
-            if live.sudo_sftp is not None:
-                try:
-                    live.sudo_sftp.close()
-                except Exception:
-                    pass
-                live.sudo_sftp = None
-                live.sudo_password = None
-            live.sftp = live.user_sftp
-        self._discard_transfer(session_id)
+        with self.session(session_id) as live:
+            live.reset_elevation()
+            transfer.clear_folder_sizes(session_id)
 
     @contextmanager
     def transfer(self, session: dict):
-        link = self._ensure_transfer(session)
-        dropped: BaseException | None = None
-        try:
-            with link.lock:
-                if link.closed:
-                    raise ConnectionDropped("上传连接已断开")
-                try:
-                    yield link
-                except (paramiko.SSHException, EOFError) as exc:
-                    link.close()
-                    dropped = exc
-        finally:
-            pass
-        if dropped is not None:
-            self._discard_transfer(session["id"], link)
-            raise ConnectionDropped(f"上传连接已断开：{dropped}") from dropped
+        with self.session(session["id"]) as live:
+            if live.elevation_method == "su":
+                # Serialize with file operations and deactivation. A root password
+                # is never retained or replayed to authenticate a second channel.
+                yield TransferLink(None, live.sftp, live.lock, elevation_method="su")
+                return
+            link = self._ensure_transfer(live)
 
-    def _ensure_transfer(self, session: dict) -> TransferLink:
-        with self._transfer_setup:
-            session_id = session["id"]
-            with self._guard:
-                live = self._lives.get(session_id)
-                if live is None or live.closed:
-                    raise NotConnected()
-                snapshot = {
-                    "host": session["host"],
-                    "port": session["port"],
-                    "username": session["username"],
-                    "auth": live.auth,
-                    "keyPath": live.key_path,
-                    "password": live.password,
-                    "passphrase": live.passphrase,
-                    "sudo": live.sudo_sftp is not None,
-                    "sudo_password": live.sudo_password,
-                }
-                current = self._transfers.get(session_id)
-            if current is not None and not current.closed and current.sudo == snapshot["sudo"]:
-                return current
-            self._discard_transfer(session_id, current)
-            client, sftp, _home = dial(snapshot, snapshot["password"], snapshot["passphrase"], False)
+        with link.lock:
+            if link.closed:
+                raise ConnectionDropped("传输连接已关闭")
             try:
-                if snapshot["sudo"]:
-                    if not snapshot["sudo_password"]:
-                        raise ValueError("sudo 查看开着，但没有可用的 sudo 密码来建立上传连接")
-                    server = sudo_access.find_sftp_server(client)
-                    root = sudo_access.open_sftp(client, server, snapshot["sudo_password"])
-                    try:
-                        sftp.close()
-                    except Exception:
-                        pass
-                    sftp = root
-            except Exception:
-                try:
-                    sftp.close()
-                except Exception:
-                    pass
-                client.close()
-                raise
-            link = TransferLink(
-                client=client,
-                sftp=sftp,
-                lock=threading.Lock(),
-                sudo=bool(snapshot["sudo"]),
-                sudo_password=snapshot["sudo_password"] if snapshot["sudo"] else None,
-            )
-            with self._guard:
-                live = self._lives.get(session_id)
-                if live is None or live.closed:
-                    link.close()
-                    raise NotConnected()
-                previous = self._transfers.pop(session_id, None)
-                self._transfers[session_id] = link
-            if previous is not None and previous is not current:
-                previous.close()
-            return link
+                yield link
+            except (paramiko.SSHException, EOFError) as exc:
+                link.close()
+                raise ConnectionDropped(f"传输连接已断开：{exc}") from exc
 
-    def _discard_transfer(self, session_id: str, expected: TransferLink | None = None) -> None:
-        with self._guard:
-            current = self._transfers.get(session_id)
-            if expected is not None and current is not expected:
-                link = expected if expected is not current else None
-            else:
-                link = self._transfers.pop(session_id, None)
-        if link is not None and not link.closed:
-            link.close()
+    def _ensure_transfer(self, live: Live) -> TransferLink:
+        # Only setup runs under live.lock. Uploads/downloads on their own link
+        # can run concurrently with browsing, and switching identity closes it.
+        if live.transfer_link is not None and not live.transfer_link.closed:
+            return live.transfer_link
+        client, sftp, _home = dial(live.login, live.password, live.passphrase, False)
+        if live.elevation_method == "sudo":
+            try:
+                server = sudo_access.find_sftp_server(client)
+                root = sudo_access.open_sftp(client, server, live.sudo_password or "")
+            except Exception:
+                _close(sftp)
+                _close(client)
+                raise
+            _close(sftp)
+            sftp = root
+        link = TransferLink(
+            client=client, sftp=sftp, lock=threading.Lock(),
+            elevation_method=live.elevation_method, sudo_password=live.sudo_password,
+        )
+        live.transfer_link = link
+        return link
 
 
 def _forget_host(client: paramiko.SSHClient, host: str, port: int) -> None:

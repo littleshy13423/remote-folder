@@ -1,0 +1,11 @@
+**
+!requirements.txt
+!app
+!app/*.py
+!static
+!static/index.html
+!tests
+!tests/elevation
+!tests/elevation/entrypoint.sh
+!tests/elevation/test_su.py
+**/._*
