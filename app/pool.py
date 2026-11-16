@@ -53,12 +53,20 @@ class Live:
     sudo_password: str | None = field(default=None, repr=False)
     elevation_method: str | None = None
     transfer_link: TransferLink | None = None
+    size_link: TransferLink | None = None
+    size_unavailable: bool = False
     closed: bool = False
     waiters: int = 0
     size_gen: int = 0
 
     def reset_elevation(self) -> None:
         # Invalidate the cached link before exposing the new identity.
+        self.size_gen += 1
+        link = self.size_link
+        self.size_link = None
+        if link is not None:
+            with link.lock:
+                link.close()
         if self.transfer_link is not None:
             self.transfer_link.close()
             self.transfer_link = None
@@ -67,7 +75,6 @@ class Live:
         self.sftp = self.user_sftp
         self.elevation_method = None
         self.sudo_password = None
-        self.size_gen += 1
 
     def close(self) -> None:
         self.closed = True
@@ -85,6 +92,7 @@ class TransferLink:
     lock: threading.Lock
     elevation_method: str | None = None
     sudo_password: str | None = field(default=None, repr=False)
+    owns_sftp: bool = False
     closed: bool = False
 
     @property
@@ -94,8 +102,9 @@ class TransferLink:
     def close(self) -> None:
         self.closed = True
         self.sudo_password = None
-        if self.client is not None:
+        if self.owns_sftp or self.client is not None:
             _close(self.sftp)
+        if self.client is not None:
             _close(self.client)
 
 
@@ -267,24 +276,164 @@ class Pool:
                 raise NotConnected()
             live.size_gen += 1
             generation = live.size_gen
-        prepared = self.call(session_id, lambda current: transfer.size_prepare(current.sftp, session_id, path))
-        if prepared.get("ready"):
-            return prepared["result"]
-        state = prepared["state"]
-        deadline = time.monotonic() + 0.12
-
-        def step(current, pending=state):
-            return transfer.size_one(current.sftp, pending, current.waiters > 0)
-
-        while state["stack"] and not state.get("capped") and time.monotonic() < deadline:
+            elevated = live.elevation_method is not None
+        if elevated:
+            return self._scan_size(
+                session_id, path, generation, lambda: self._shared_turn(session_id), shared=True,
+            )
+        link = self._ensure_size_link(session_id)
+        if link is None:
+            return self._scan_size(
+                session_id, path, generation, lambda: self._shared_turn(session_id), shared=True,
+            )
+        try:
+            return self._scan_size(
+                session_id, path, generation, lambda: self._dedicated_turn(link), shared=False,
+            )
+        except (paramiko.SSHException, EOFError, ConnectionDropped) as exc:
+            self._drop_size_link(session_id)
+            transfer.abandon_channel_sizes(session_id, shared=False)
             if not self._same_size_gen(session_id, generation):
-                return transfer.size_view(state, stale=True)
-            state = self.call(session_id, step)
-            if state.get("yielded"):
-                break
+                return _stale_size(path, None)
+            raise OSError("统计连接已断开") from exc
+
+    def interrupt_size_scan(self, session_id: str, wait: bool = False) -> None:
+        with self._guard:
+            live = self._lives.get(session_id)
+            if live is None or live.closed:
+                return
+            live.size_gen += 1
+            link = live.size_link
+        if link is None:
+            return
+        locked = link.lock.acquire(blocking=wait)
+        if not locked:
+            return
+        try:
+            if not link.closed:
+                transfer.abandon_channel_sizes(session_id, shared=False)
+        finally:
+            link.lock.release()
+
+    def _scan_size(self, session_id: str, path: str, generation: int, turn_of, shared: bool) -> dict:
+        state = None
+        deadline = time.monotonic() + _SIZE_SLICE
+        while True:
+            if not self._same_size_gen(session_id, generation):
+                self._stop_size(session_id, state, generation, turn_of)
+                return _stale_size(path, state)
+            with turn_of() as (sftp, busy):
+                if sftp is None:
+                    raise OSError("统计连接已关闭")
+                view, state, again = self._size_chunk(
+                    session_id, path, generation, state, deadline, sftp, busy, shared,
+                )
+            if not again:
+                return view
+
+    def _size_chunk(self, session_id, path, generation, state, deadline, sftp, busy, shared: bool):
         if not self._same_size_gen(session_id, generation):
-            return transfer.size_view(state, stale=True)
-        return transfer.size_commit(session_id, state)
+            if state is not None:
+                transfer.abandon_size_state(session_id, state, generation)
+            return _stale_size(path, state), state, False
+        if busy and state is None:
+            return {
+                "path": path, "size": 0, "partial": True, "limited": False, "counted": False, "stale": False,
+            }, None, False
+        if state is None:
+            prepared = transfer.size_prepare(sftp, session_id, path)
+            if prepared.get("ready"):
+                return prepared["result"], None, False
+            state = prepared["state"]
+            state["owner"] = generation
+            state["shared"] = shared
+        if busy:
+            transfer.size_one(sftp, state, True)
+            return transfer.size_commit(session_id, state), state, False
+        if transfer.size_finished(state) or time.monotonic() >= deadline:
+            return transfer.size_commit(session_id, state), state, False
+        transfer.size_one(sftp, state, False)
+        if not self._same_size_gen(session_id, generation):
+            transfer.abandon_size_state(session_id, state, generation)
+            return _stale_size(path, state), state, False
+        if state.get("yielded") or transfer.size_finished(state) or time.monotonic() >= deadline:
+            return transfer.size_commit(session_id, state), state, False
+        return None, state, True
+
+    def _stop_size(self, session_id: str, state, generation: int, turn_of) -> None:
+        if state is None:
+            return
+        try:
+            with turn_of() as (sftp, _busy):
+                if sftp is not None:
+                    transfer.abandon_size_state(session_id, state, generation)
+        except (NotConnected, ConnectionDropped, paramiko.SSHException, EOFError, OSError):
+            transfer.abandon_size_state(session_id, state, generation)
+
+    @contextmanager
+    def _shared_turn(self, session_id: str):
+        with self.session(session_id) as live:
+            yield live.sftp, live.waiters > 0
+
+    @contextmanager
+    def _dedicated_turn(self, link: TransferLink):
+        with link.lock:
+            if link.closed:
+                yield None, False
+                return
+            yield link.sftp, False
+
+    def _ensure_size_link(self, session_id: str) -> TransferLink | None:
+        with self._guard:
+            live = self._lives.get(session_id)
+            if live is None or live.closed:
+                raise NotConnected()
+            if live.elevation_method is not None or live.size_unavailable:
+                return None
+            if live.size_link is not None and not live.size_link.closed:
+                return live.size_link
+            client = live.client
+        try:
+            sftp = client.open_sftp()
+        except (paramiko.SSHException, EOFError, OSError):
+            with self._guard:
+                current = self._lives.get(session_id)
+                if current is not None and current.client is client:
+                    current.size_unavailable = True
+            return None
+        try:
+            channel = sftp.get_channel()
+        except Exception:
+            channel = None
+        if channel is not None:
+            try:
+                channel.settimeout(None)
+            except Exception:
+                pass
+        link = TransferLink(client=None, sftp=sftp, lock=threading.Lock(), owns_sftp=True)
+        with self._guard:
+            live = self._lives.get(session_id)
+            if live is None or live.closed or live.elevation_method is not None or live.client is not client:
+                link.close()
+                if live is None or live.closed:
+                    raise NotConnected()
+                return None
+            if live.size_link is not None and not live.size_link.closed:
+                link.close()
+                return live.size_link
+            live.size_link = link
+            return link
+
+    def _drop_size_link(self, session_id: str) -> None:
+        with self._guard:
+            live = self._lives.get(session_id)
+            if live is None:
+                return
+            link = live.size_link
+            live.size_link = None
+        if link is not None:
+            with link.lock:
+                link.close()
 
     def _same_size_gen(self, session_id: str, generation: int) -> bool:
         with self._guard:
@@ -378,6 +527,15 @@ def _forget_host(client: paramiko.SSHClient, host: str, port: int) -> None:
     for name in (host, f"[{host}]:{port}"):
         if name in keys:
             del keys[name]
+
+
+_SIZE_SLICE = 0.12
+
+
+def _stale_size(path: str, state: dict | None) -> dict:
+    if state is None:
+        return {"path": path, "size": 0, "partial": True, "limited": False, "counted": False, "stale": True}
+    return transfer.size_view(state, stale=True)
 
 
 pool = Pool()

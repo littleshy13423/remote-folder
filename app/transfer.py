@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 
 import paramiko
+from paramiko.sftp import CMD_CLOSE, CMD_HANDLE, CMD_NAME, CMD_OPENDIR, CMD_READDIR, SFTPError
+from paramiko.sftp_attr import SFTPAttributes
 
 from app.home import get_home
 from app.remote_path import is_directory, mode_string, parent_path, remote_join, safe_name, safe_relative
@@ -792,20 +794,51 @@ _size_cache: dict[tuple[str, str], tuple[float, int, bool]] = {}
 _progress: dict[tuple[str, str], dict] = {}
 _size_guard = threading.Lock()
 _MAX_SIZE_NODES = 4000
+_MAX_OPEN_READERS = 8
 
 
 def clear_folder_sizes(session_id: str) -> None:
     with _size_guard:
         for key in [item for item in _size_cache if item[0] == session_id]:
             _size_cache.pop(key, None)
+        states = []
         for key in [item for item in _progress if item[0] == session_id]:
+            states.append(_progress.pop(key))
+    for state in states:
+        state["owner"] = None
+        state["abandoned"] = True
+        _close_reader(state)
+
+
+def abandon_size_state(session_id: str, state: dict, generation: int) -> None:
+    if state.get("owner") != generation:
+        return
+    state["owner"] = None
+    state["abandoned"] = True
+    key = (session_id, state.get("path"))
+    with _size_guard:
+        if _progress.get(key) is state:
             _progress.pop(key, None)
+    _close_reader(state)
+
+
+def abandon_channel_sizes(session_id: str, shared: bool) -> None:
+    with _size_guard:
+        states = []
+        for key, state in list(_progress.items()):
+            if key[0] == session_id and bool(state.get("shared")) == shared:
+                states.append(_progress.pop(key))
+                state["owner"] = None
+                state["abandoned"] = True
+    for state in states:
+        _close_reader(state)
 
 
 def size_prepare(sftp, session_id: str, path: str) -> dict:
     current = sftp.normalize(path)
     key = (session_id, current)
     now = time.monotonic()
+    evicted = None
     with _size_guard:
         hit = _size_cache.get(key)
         if hit is not None:
@@ -816,9 +849,13 @@ def size_prepare(sftp, session_id: str, path: str) -> dict:
                     "result": {"path": current, "size": size, "partial": partial, "limited": True, "counted": True},
                 }
         state = _progress.get(key)
+        if state is not None and state.get("abandoned"):
+            _progress.pop(key, None)
+            state = None
         if state is None:
             state = {
                 "path": current,
+                "session": session_id,
                 "stack": [current],
                 "seen": set(),
                 "total": 0,
@@ -830,10 +867,19 @@ def size_prepare(sftp, session_id: str, path: str) -> dict:
             }
             _progress[key] = state
             if len(_progress) > 48:
-                oldest = next(iter(_progress))
-                if oldest != key:
-                    _progress.pop(oldest, None)
+                for old_key in list(_progress):
+                    if old_key != key and old_key[0] == session_id:
+                        evicted = _progress.pop(old_key)
+                        evicted["owner"] = None
+                        evicted["abandoned"] = True
+                        break
+    if evicted is not None:
+        _close_reader(evicted)
     return {"ready": False, "state": state}
+
+
+def size_finished(state: dict) -> bool:
+    return not state["stack"] and state.get("reader") is None
 
 
 def size_one(sftp, state: dict, yield_now: bool) -> dict:
@@ -841,23 +887,47 @@ def size_one(sftp, state: dict, yield_now: bool) -> dict:
         state["yielded"] = True
         return state
     state["yielded"] = False
-    if not state["stack"] or state.get("capped"):
+    if state.get("abandoned"):
         return state
-    if state["nodes"] >= _MAX_SIZE_NODES:
+    if state.get("capped") or state["nodes"] >= _MAX_SIZE_NODES:
         state["capped"] = True
         state["stack"] = []
+        _close_reader(state)
         return state
-    folder = state["stack"].pop()
-    if folder in state["seen"]:
-        return state
-    state["seen"].add(folder)
-    state["counted"] = True
+    if state.get("reader") is None:
+        folder = None
+        while state["stack"]:
+            candidate = state["stack"].pop()
+            if candidate not in state["seen"]:
+                folder = candidate
+                break
+        if folder is None:
+            return state
+        state["seen"].add(folder)
+        state["counted"] = True
+        state["reader_dir"] = folder
+        try:
+            _trim_open_readers(state)
+            state["reader"] = _open_size_dir(sftp, folder)
+        except EOFError:
+            if _channel_alive(sftp):
+                state["blocked"] = True
+                return state
+            raise
+        except (OSError, SFTPError):
+            state["blocked"] = True
+            return state
+    reader = state["reader"]
     try:
-        children = sftp.listdir_attr(folder)
-    except OSError:
+        entries = reader.read()
+    except (OSError, SFTPError):
+        _close_reader(state)
         state["blocked"] = True
         return state
-    for child in children:
+    if reader.exhausted:
+        state.pop("reader", None)
+    folder = state.get("reader_dir") or state["path"]
+    for child in entries:
         if child.filename in (".", ".."):
             continue
         state["nodes"] += 1
@@ -871,12 +941,13 @@ def size_one(sftp, state: dict, yield_now: bool) -> dict:
         if state["nodes"] >= _MAX_SIZE_NODES:
             state["capped"] = True
             state["stack"] = []
+            _close_reader(state)
             break
     return state
 
 
 def size_view(state: dict, stale: bool = False) -> dict:
-    finished = not state["stack"]
+    finished = size_finished(state)
     partial = bool(state["blocked"] or state["capped"] or not finished)
     return {
         "path": state["path"],
@@ -889,15 +960,133 @@ def size_view(state: dict, stale: bool = False) -> dict:
 
 
 def size_commit(session_id: str, state: dict) -> dict:
+    if state.get("abandoned"):
+        return size_view(state, stale=True)
+    if size_finished(state):
+        _close_reader(state)
     key = (session_id, state["path"])
     view = size_view(state, stale=False)
     with _size_guard:
+        if state.get("abandoned"):
+            return size_view(state, stale=True)
         if view["limited"]:
             _progress.pop(key, None)
             _size_cache[key] = (time.monotonic(), state["total"], view["partial"])
         else:
             _progress[key] = state
     return view
+
+
+def _trim_open_readers(state: dict) -> None:
+    session_id = state.get("session")
+    if not session_id:
+        return
+    while True:
+        with _size_guard:
+            open_states = [
+                item for key, item in _progress.items()
+                if key[0] == session_id and item.get("reader") is not None and item is not state
+            ]
+        if len(open_states) < _MAX_OPEN_READERS:
+            return
+        old = open_states[0]
+        old["owner"] = None
+        old["abandoned"] = True
+        with _size_guard:
+            key = (session_id, old.get("path"))
+            if _progress.get(key) is old:
+                _progress.pop(key, None)
+        _close_reader(old)
+
+
+def _close_reader(state: dict) -> None:
+    reader = state.pop("reader", None)
+    if reader is not None:
+        reader.close()
+
+
+def _channel_alive(sftp) -> bool:
+    get_channel = getattr(type(sftp), "get_channel", None)
+    if not callable(get_channel):
+        return True
+    try:
+        channel = sftp.get_channel()
+    except Exception:
+        return False
+    return channel is not None and not channel.closed
+
+
+def _chunked_listing(sftp) -> bool:
+    return callable(getattr(type(sftp), "_request", None)) and callable(getattr(type(sftp), "_adjust_cwd", None))
+
+
+def _open_size_dir(sftp, path: str):
+    if not _chunked_listing(sftp):
+        return _MemoryDir(sftp.listdir_attr(path))
+    return _RemoteDir(sftp, path)
+
+
+class _MemoryDir:
+    def __init__(self, entries) -> None:
+        self._entries = list(entries)
+        self.exhausted = False
+
+    def read(self):
+        if self.exhausted:
+            return []
+        self.exhausted = True
+        return self._entries
+
+    def close(self) -> None:
+        self.exhausted = True
+
+
+class _RemoteDir:
+    # One READDIR packet per read(), so the caller can release the channel between packets.
+    def __init__(self, sftp, path: str) -> None:
+        self.sftp = sftp
+        self.handle = None
+        self.exhausted = False
+        current = sftp._adjust_cwd(path)
+        kind, msg = sftp._request(CMD_OPENDIR, current)
+        if kind != CMD_HANDLE:
+            raise OSError("无法列出目录")
+        self.handle = msg.get_binary() if hasattr(msg, "get_binary") else msg.get_string()
+
+    def read(self):
+        if self.handle is None:
+            self.exhausted = True
+            return []
+        try:
+            kind, msg = self.sftp._request(CMD_READDIR, self.handle)
+        except EOFError:
+            alive = _channel_alive(self.sftp)
+            self.close()
+            if alive:
+                return []
+            raise
+        if kind != CMD_NAME:
+            self.close()
+            raise OSError("无法列出目录")
+        count = msg.get_int()
+        entries = []
+        for _ in range(count):
+            filename = msg.get_text()
+            longname = msg.get_text()
+            attr = SFTPAttributes._from_msg(msg, filename, longname)
+            if filename not in (".", ".."):
+                entries.append(attr)
+        return entries
+
+    def close(self) -> None:
+        handle, self.handle = self.handle, None
+        self.exhausted = True
+        if handle is None:
+            return
+        try:
+            self.sftp._request(CMD_CLOSE, handle)
+        except Exception:
+            pass
 
 
 def _cache_target(session_id: str, remote_path: str) -> Path:

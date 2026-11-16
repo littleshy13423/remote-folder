@@ -118,6 +118,67 @@ class PoolElevationTests(unittest.TestCase):
         self.assertIsNone(self.live.sudo_password)
         self.assertFalse(self.pool.connected("test"))
 
+    def test_size_scan_does_not_block_browsing(self):
+        class SizeSftp:
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.requests = 0
+
+            def normalize(self, path):
+                return path
+
+            def _adjust_cwd(self, path):
+                return path
+
+            def _request(self, _cmd, _arg=None):
+                self.requests += 1
+                self.started.set()
+                self.assertTrue(self.release.wait(2), "size scan stayed blocked")
+                raise EOFError()
+
+        size_sftp = SizeSftp()
+        size_sftp.assertTrue = self.assertTrue
+        self.live.client.open_sftp.return_value = size_sftp
+        result = {}
+
+        def run():
+            try:
+                result["value"] = self.pool.scan_size("test", "/var/log")
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(size_sftp.started.wait(2), "size scan did not start")
+        browsed = threading.Event()
+
+        def browse(_live):
+            browsed.set()
+
+        threading.Thread(target=lambda: self.pool.call("test", browse), daemon=True).start()
+        self.assertTrue(browsed.wait(1), "browsing waited for the folder size scan")
+        self.live.sftp.listdir_attr.assert_not_called()
+        self.live.sftp.normalize.assert_not_called()
+        size_sftp.release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive(), "size scan did not finish")
+        self.assertNotIn("error", result, result.get("error"))
+        self.assertEqual(self.live.client.open_sftp.call_count, 1)
+        self.pool.scan_size("test", "/var/log")
+        self.assertEqual(self.live.client.open_sftp.call_count, 1, "size channel was opened twice")
+
+    def test_su_size_scan_stays_on_shared_channel(self):
+        self.pool.enable_sudo("test", "root secret", method="su")
+        sftp = self.su.return_value
+        sftp.normalize.side_effect = lambda path: path
+        sftp.listdir_attr.return_value = []
+        result = self.pool.scan_size("test", "/etc")
+        self.assertEqual(result["size"], 0)
+        self.assertFalse(result["partial"])
+        self.live.client.open_sftp.assert_not_called()
+        sftp.listdir_attr.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -460,32 +460,39 @@ async function measureFolders(token, sessionId, signal) {
   } catch {
     return;
   }
-  if (token !== sizeToken || sessionId !== state.activeId || signal.aborted) return;
-  const folders = state.entries.filter((entry) => entry.isDir);
-  for (const entry of folders) {
-    let resume = true;
-    while (resume) {
+  let pending = state.entries.filter((entry) => entry.isDir);
+  while (pending.length) {
+    if (token !== sizeToken || sessionId !== state.activeId || signal.aborted) return;
+    const again = [];
+    let progressed = false;
+    for (const entry of pending) {
       if (token !== sizeToken || sessionId !== state.activeId || signal.aborted) return;
       try {
         const data = await api(`/api/sessions/${sessionId}/size?path=${encodeURIComponent(entry.path)}`, { signal });
         if (token !== sizeToken || sessionId !== state.activeId || data.stale) return;
         if (data.counted) {
+          progressed = true;
           entry.size = data.size;
           entry.partial = Boolean(data.partial);
           entry.sizeFailed = false;
           if (state.sort.key === "size") renderRows();
           else paintFolderSize(entry);
         }
-        resume = Boolean(data.partial) && !data.limited && !data.stale;
-        if (resume) await sleep(data.counted ? 40 : 180, signal);
+        if (data.partial && !data.limited && !data.stale) again.push(entry);
       } catch (error) {
         if (error && error.name === "AbortError") return;
         if (token !== sizeToken || sessionId !== state.activeId) return;
         entry.sizeFailed = true;
         entry.partial = false;
         paintFolderSize(entry);
-        resume = false;
       }
+    }
+    pending = again;
+    if (!pending.length) return;
+    try {
+      await sleep(progressed ? 40 : 180, signal);
+    } catch {
+      return;
     }
   }
 }

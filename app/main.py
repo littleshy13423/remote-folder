@@ -365,6 +365,7 @@ def install_key(session_id: str):
 def disconnect_session(session_id: str):
     _session_or_404(session_id)
     opener.flush_session(session_id)
+    pool.interrupt_size_scan(session_id, wait=True)
     transfer.clear_folder_sizes(session_id)
     pool.disconnect(session_id)
     return {"ok": True}
@@ -373,8 +374,10 @@ def disconnect_session(session_id: str):
 @app.get("/api/sessions/{session_id}/list")
 def list_directory(session_id: str, path: str = ""):
     session = _session_or_404(session_id)
+    pool.interrupt_size_scan(session_id)
 
     def work(live):
+        transfer.abandon_channel_sizes(session_id, shared=True)
         return transfer.list_directory(live.sftp, path or live.home)
 
     data = _run(session_id, work)

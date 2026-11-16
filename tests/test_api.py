@@ -143,6 +143,65 @@ def main() -> None:
         yielded = size_one(BusySftp(), paused, True)
         expect(yielded["yielded"] is True and yielded["counted"] is False, "size scan did not yield")
 
+        class ChunkSftp:
+            reads = 0
+            closed = False
+
+            def _adjust_cwd(self, path):
+                return path
+
+            def _request(self, cmd, _arg=None):
+                from paramiko.message import Message
+                from paramiko.sftp import CMD_CLOSE, CMD_HANDLE, CMD_NAME, CMD_OPENDIR, CMD_READDIR
+
+                if cmd == CMD_OPENDIR:
+                    msg = Message()
+                    msg.add_string(b"dir")
+                    msg.rewind()
+                    return CMD_HANDLE, msg
+                if cmd == CMD_CLOSE:
+                    self.closed = True
+                    msg = Message()
+                    msg.rewind()
+                    return 0, msg
+                if cmd != CMD_READDIR:
+                    raise AssertionError(cmd)
+                self.reads += 1
+                if self.reads > 2:
+                    raise EOFError()
+                msg = Message()
+                msg.add_int(1)
+                msg.add_string(f"f{self.reads}.bin")
+                msg.add_string("-rw-r--r-- 1 user user 5")
+                msg.add_int(0x1 | 0x4)
+                msg.add_int64(5)
+                msg.add_int(stat.S_IFREG | 0o644)
+                msg.rewind()
+                return CMD_NAME, msg
+
+        chunk = ChunkSftp()
+        partial = {
+            "path": "/data",
+            "stack": ["/data"],
+            "seen": set(),
+            "total": 0,
+            "nodes": 0,
+            "blocked": False,
+            "capped": False,
+            "counted": False,
+            "yielded": False,
+        }
+        size_one(chunk, partial, False)
+        expect(chunk.reads == 1 and partial["total"] == 5 and partial.get("reader") is not None, "size scan read the whole directory")
+        expect(chunk.closed is False, "directory handle closed before the listing finished")
+        size_one(chunk, partial, True)
+        expect(chunk.reads == 1 and partial["yielded"] is True, "size scan kept reading while browsing")
+        partial["yielded"] = False
+        size_one(chunk, partial, False)
+        expect(partial["total"] == 10 and chunk.reads == 2, "second directory packet was skipped")
+        size_one(chunk, partial, False)
+        expect(chunk.closed is True and partial.get("reader") is None and partial["stack"] == [], "directory listing did not finish")
+
         root = home / "remote"
         root.mkdir()
         stub = SftpStub(str(root), "user", "s3cret-token")
@@ -295,12 +354,17 @@ def main() -> None:
                 expect(any(line.get("message") for line in uploaded_lines), uploaded.text)
                 expect(len(stub._transports) >= 2, "upload used the browsing connection")
                 expect((root / "docs" / "hello.txt").read_bytes() == b"hello remote", "upload did not land")
+                nested = root / "docs" / "nested"
+                nested.mkdir()
+                (nested / "a.txt").write_bytes(b"xyz")
                 sized = request("GET", f"/api/sessions/{session_id}/size?path=/docs")
                 expect(sized.status_code == 200, sized.text)
-                expect(sized.json()["size"] == len(b"hello remote"), sized.text)
+                expect(sized.json()["size"] == len(b"hello remote") + len(b"xyz"), sized.text)
                 expect(sized.json()["partial"] is False, sized.text)
                 cached = request("GET", f"/api/sessions/{session_id}/size?path=/docs")
-                expect(cached.json()["size"] == len(b"hello remote"), cached.text)
+                expect(cached.json()["size"] == len(b"hello remote") + len(b"xyz"), cached.text)
+                (nested / "a.txt").unlink()
+                nested.rmdir()
 
                 blocked = request(
                     "POST",
