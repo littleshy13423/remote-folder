@@ -382,6 +382,174 @@ function renderChrome() {
     th.dataset.label = base;
     th.textContent = base + mark;
   });
+  syncMonitor();
+}
+
+let monitorOn = localStorage.getItem("rf-monitor") !== "0";
+let monitorTimer = null;
+let monitorTarget = null;
+let monitorLoop = 0;
+let monitorBusy = false;
+let cpuHistorySession = null;
+const cpuHistory = [];
+const monitorSkip = new Set();
+
+function syncMonitor() {
+  const box = $("monitor-enabled");
+  if (!box) return;
+  box.checked = monitorOn;
+  const session = currentSession();
+  const connected = Boolean(session?.connected);
+  const skipped = Boolean(session && monitorSkip.has(session.id));
+  $("monitor-meters").hidden = !monitorOn || !connected;
+  const visible = document.visibilityState !== "hidden";
+  const target = monitorOn && connected && visible && !skipped ? session.id : null;
+  if (skipped && monitorOn && connected) showUnsupported();
+  if (target === monitorTarget) return;
+  const previous = monitorTarget;
+  monitorTarget = target;
+  monitorLoop += 1;
+  if (monitorTimer) {
+    clearInterval(monitorTimer);
+    monitorTimer = null;
+  }
+  if (!target) {
+    if (!monitorOn || !connected) resetMonitorMeters();
+    return;
+  }
+  if (target !== previous && target !== cpuHistorySession) {
+    cpuHistorySession = target;
+    cpuHistory.length = 0;
+    resetMonitorMeters();
+  }
+  const token = monitorLoop;
+  const tick = () => pollMonitor(target, token);
+  tick();
+  monitorTimer = setInterval(tick, 2000);
+}
+
+function resetMonitorMeters() {
+  $("cpu-value").textContent = "—";
+  $("cpu-value").className = "meter-value";
+  $("mem-value").textContent = "—";
+  $("mem-value").className = "meter-value";
+  $("cpu-spark").replaceChildren();
+  $("mem-fill").style.width = "0";
+  $("mem-fill").className = "meter-fill";
+}
+
+function showUnsupported() {
+  $("cpu-value").textContent = "不支持";
+  $("cpu-value").className = "meter-value";
+  $("mem-value").textContent = "不支持";
+  $("mem-value").className = "meter-value";
+  $("cpu-spark").replaceChildren();
+  $("mem-fill").style.width = "0";
+  $("mem-fill").className = "meter-fill";
+}
+
+function meterLevel(percent) {
+  if (percent >= 90) return "hot";
+  if (percent >= 70) return "warn";
+  return "ok";
+}
+
+function meterColor(percent) {
+  if (percent >= 90) return "#c4473a";
+  if (percent >= 70) return "#d0891f";
+  return "#0f6e62";
+}
+
+function formatMem(bytes) {
+  const gib = bytes / 1024 / 1024 / 1024;
+  if (gib >= 1) return `${gib.toFixed(1)} GB`;
+  const mib = bytes / 1024 / 1024;
+  if (mib >= 1) return `${Math.round(mib)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function drawCpu(values) {
+  const svg = $("cpu-spark");
+  svg.replaceChildren();
+  const width = 64;
+  const height = 16;
+  const count = 24;
+  const shown = values.slice(-count);
+  const gap = 1;
+  const barWidth = (width - gap * (count - 1)) / count;
+  const offset = count - shown.length;
+  shown.forEach((value, index) => {
+    const clamped = Math.max(0, Math.min(100, value));
+    const barHeight = Math.max(1, (clamped / 100) * height);
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("x", String((offset + index) * (barWidth + gap)));
+    rect.setAttribute("y", String(height - barHeight));
+    rect.setAttribute("width", String(barWidth));
+    rect.setAttribute("height", String(barHeight));
+    rect.setAttribute("fill", meterColor(clamped));
+    svg.append(rect);
+  });
+}
+
+function paintMonitor(data) {
+  const cpu = data.cpu;
+  const memory = data.memory;
+  if (typeof cpu === "number") {
+    cpuHistory.push(cpu);
+    if (cpuHistory.length > 24) cpuHistory.shift();
+    const level = meterLevel(cpu);
+    $("cpu-value").textContent = `${Math.round(cpu)}%`;
+    $("cpu-value").className = `meter-value ${level}`;
+    drawCpu(cpuHistory);
+  } else if (!cpuHistory.length) {
+    $("cpu-value").textContent = "…";
+    $("cpu-value").className = "meter-value";
+  }
+  const level = meterLevel(memory.percent);
+  $("mem-fill").style.width = `${Math.max(0, Math.min(100, memory.percent))}%`;
+  $("mem-fill").className = `meter-fill ${level}`;
+  $("mem-value").textContent = `${formatMem(memory.used)} / ${formatMem(memory.total)}`;
+  $("mem-value").className = `meter-value ${level}`;
+  $("mem-value").title = `已用 ${memory.percent}%`;
+}
+
+async function pollMonitor(id, token) {
+  if (monitorBusy || token !== monitorLoop) return;
+  monitorBusy = true;
+  try {
+    const data = await api(`/api/sessions/${id}/stats`);
+    if (token !== monitorLoop || id !== state.activeId) return;
+    if (data?.pending) return;
+    if (!data?.supported || !data.memory) {
+      if (data && data.supported === false) {
+        monitorSkip.add(id);
+        showUnsupported();
+        if (monitorTimer) {
+          clearInterval(monitorTimer);
+          monitorTimer = null;
+        }
+        monitorTarget = null;
+      }
+      return;
+    }
+    paintMonitor(data);
+  } catch (error) {
+    if (token !== monitorLoop || id !== state.activeId) return;
+    if (error.status === 409 && error.payload?.needConnect) {
+      const session = state.sessions.find((item) => item.id === id);
+      if (session?.connected) {
+        session.connected = false;
+        session.sudo = false;
+        session.elevationMethod = null;
+        render();
+      }
+      return;
+    }
+    $("cpu-value").textContent = "—";
+    $("mem-value").textContent = "—";
+  } finally {
+    monitorBusy = false;
+  }
 }
 
 function render() {
@@ -690,6 +858,7 @@ async function openSession(id, options = {}) {
       session.connected = true;
       session.sudo = false;
       session.elevationMethod = null;
+      monitorSkip.delete(session.id);
     }
     try {
       await browse(session && session.lastPath ? session.lastPath : "");
@@ -1041,14 +1210,59 @@ async function removeSelected() {
     danger: true,
   });
   if (!ok) return;
-  await busy("正在删除…", async () => {
-    await api(`/api/sessions/${state.activeId}/delete`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ paths: entries.map((entry) => entry.path) }),
-    });
-    await browse(state.path);
+  const paths = entries.map((entry) => entry.path);
+  let root = null;
+  while (true) {
+    try {
+      await busy("正在删除…", () => deletePaths(paths, root));
+      break;
+    } catch (error) {
+      const authFailed = root && /密码|认证|sorry|incorrect/i.test(error.message || "");
+      if (!error.payload?.needsRootPassword && !authFailed) throw error;
+      const form = await askRootDeletePassword();
+      if (!form) return;
+      root = { rootMethod: form.method, rootPassword: form.password };
+    }
+  }
+  await browse(state.path);
+}
+
+function deletePaths(paths, root) {
+  return api(`/api/sessions/${state.activeId}/delete`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ paths, ...(root || {}) }),
   });
+}
+
+async function askRootDeletePassword() {
+  const session = currentSession();
+  const form = await openDialog({
+    title: "需要 root 才能删除",
+    message: "输入密码后会执行一次 rm。密码只用于这次删除，不会保存。",
+    fields: [
+      { name: "method", label: "提权方式", type: "select", value: session?.elevationMethod === "su" ? "su" : "sudo",
+        options: [["sudo", "sudo · 使用当前账号"], ["su", "su root · 使用 root 密码"]] },
+      { name: "password", label: "当前账号的 sudo 密码", type: "password" },
+    ],
+    build() {
+      const inputs = $("modal-form").elements;
+      const picker = inputs.namedItem("method");
+      const password = inputs.namedItem("password");
+      function selectMethod() {
+        const su = picker.value === "su";
+        password.value = "";
+        password.required = su;
+        password.placeholder = su ? "输入 root 密码" : "免密 sudo 时可留空";
+        password.labels[0].textContent = su ? "root 密码" : "当前账号的 sudo 密码";
+      }
+      picker.onchange = selectMethod;
+      selectMethod();
+    },
+    okText: "删除",
+    danger: true,
+  });
+  return form;
 }
 
 function freshName(directory) {
@@ -1690,6 +1904,19 @@ function bind() {
   $("download").addEventListener("click", () => downloadSelected().catch(showError));
   $("download-history").addEventListener("click", () => showDownloadHistory().catch(showError));
   $("open-bash").addEventListener("click", () => openBash(state.path).catch(showError));
+  $("monitor-enabled").addEventListener("change", () => {
+    monitorOn = $("monitor-enabled").checked;
+    localStorage.setItem("rf-monitor", monitorOn ? "1" : "0");
+    if (state.activeId) monitorSkip.delete(state.activeId);
+    if (monitorTimer) {
+      clearInterval(monitorTimer);
+      monitorTimer = null;
+    }
+    monitorTarget = null;
+    cpuHistorySession = null;
+    syncMonitor();
+  });
+  document.addEventListener("visibilitychange", () => syncMonitor());
   $("sudo-btn").addEventListener("click", () => {
     const run = currentSession()?.sudo ? disableElevation() : offerElevation(false);
     run.catch(showError);

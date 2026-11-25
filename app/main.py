@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
-from app import downloads, keys, notices, opener, pick_file, store, sudo, terminal, transfer
+from app import downloads, keys, notices, opener, pick_file, stats, store, sudo, terminal, transfer
 from app.remote_path import safe_relative
 from app.pool import (
     AuthFailed,
@@ -87,6 +87,12 @@ class RenameBody(BaseModel):
 class PathsBody(BaseModel):
     paths: list[str]
     saveToken: str = ""
+
+
+class DeleteBody(BaseModel):
+    paths: list[str]
+    rootPassword: str = ""
+    rootMethod: str = ""
 
 
 class OpenLocalBody(BaseModel):
@@ -268,6 +274,7 @@ def update_session(session_id: str, body: SessionBody):
         raise APIError(400, str(exc))
     opener.flush_session(session_id)
     opener.drop_session(session_id)
+    stats.forget(session_id)
     pool.disconnect(session_id)
     return _public(session)
 
@@ -277,6 +284,7 @@ def remove_session(session_id: str):
     _session_or_404(session_id)
     opener.flush_session(session_id)
     opener.drop_session(session_id)
+    stats.forget(session_id)
     pool.disconnect(session_id)
     store.delete_session(session_id)
     return {"ok": True}
@@ -293,6 +301,7 @@ def connect_session(session_id: str, body: ConnectBody):
         if body.passphrase and body.remember:
             store.set_secret(session_id, "passphrase", body.passphrase)
         home = pool.connect(session, password, passphrase, body.trustHost)
+        stats.forget(session_id)
     except AuthRequired as exc:
         raise APIError(401, str(exc), authRequired=True, secretKind=exc.kind)
     except AuthFailed as exc:
@@ -367,6 +376,7 @@ def disconnect_session(session_id: str):
     opener.flush_session(session_id)
     pool.interrupt_size_scan(session_id, wait=True)
     transfer.clear_folder_sizes(session_id)
+    stats.forget(session_id)
     pool.disconnect(session_id)
     return {"ok": True}
 
@@ -410,16 +420,22 @@ def rename(session_id: str, body: RenameBody):
 
 
 @app.post("/api/sessions/{session_id}/delete")
-def delete(session_id: str, body: PathsBody):
+def delete(session_id: str, body: DeleteBody):
     _session_or_404(session_id)
+
     def run(live):
-        return transfer.delete_paths(
-            live.sftp,
-            body.paths,
-            client=None if live.elevation_method == "su" else live.client,
-            as_root=live.elevation_method == "sudo",
-            sudo_password=live.sudo_password,
-        )
+        try:
+            return transfer.delete_paths(
+                live.sftp,
+                body.paths,
+                client=live.client,
+                as_root=live.elevation_method == "sudo",
+                sudo_password=live.sudo_password,
+                root_password=body.rootPassword,
+                root_method=body.rootMethod or None,
+            )
+        except transfer.RootPasswordRequired:
+            raise APIError(403, "删除这些项目需要 root 权限", needsRootPassword=True)
 
     return _run(session_id, run)
 
@@ -594,6 +610,12 @@ def download(session_id: str, body: PathsBody):
 @app.get("/api/notices")
 def list_notices():
     return {"notices": notices.drain()}
+
+
+@app.get("/api/sessions/{session_id}/stats")
+def session_stats(session_id: str):
+    _session_or_404(session_id)
+    return _invoke(session_id, lambda: stats.read(session_id))
 
 
 @app.post("/api/sessions/{session_id}/terminal")

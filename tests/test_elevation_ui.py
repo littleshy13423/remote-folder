@@ -37,6 +37,12 @@ def test_elevation_ui():
             route.fulfill(json={"ok": True, "sudo": session["sudo"], "elevationMethod": session["elevationMethod"]})
         elif url.path.endswith("/notices"):
             route.fulfill(json={"notices": []})
+        elif url.path.endswith("/stats"):
+            route.fulfill(json={
+                "supported": True,
+                "cpu": 12,
+                "memory": {"used": 2147483648, "total": 8589934592, "percent": 25},
+            })
         else:
             route.fulfill(json={})
 
@@ -86,6 +92,14 @@ def test_elevation_ui():
         expect(toolbar).to_have_text("关闭 sudo")
         expect(page.locator("#status")).to_contain_text("root（sudo）")
         assert requests[-1] == {"enable": True, "method": "sudo", "password": "", "remember": False}
+        expect(page.locator("#cpu-value")).to_have_text("12%")
+        expect(page.locator("#mem-value")).to_have_text("2.0 GB / 8.0 GB")
+        expect(page.locator("#cpu-spark rect").first).to_be_attached()
+        page.locator("#monitor-enabled").uncheck()
+        expect(page.locator("#monitor-meters")).to_be_hidden()
+        page.locator("#monitor-enabled").check()
+        expect(page.locator("#monitor-meters")).to_be_visible()
+        expect(page.locator("#cpu-value")).to_have_text("12%")
         browser.close()
 
 

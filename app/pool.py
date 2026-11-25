@@ -269,6 +269,13 @@ class Pool:
         with self.session(session_id) as live:
             return fn(live)
 
+    def login_password(self, session_id: str) -> str | None:
+        with self._guard:
+            live = self._lives.get(session_id)
+            if live is None or live.closed:
+                return None
+            return live.password or None
+
     def scan_size(self, session_id: str, path: str) -> dict:
         with self._guard:
             live = self._lives.get(session_id)

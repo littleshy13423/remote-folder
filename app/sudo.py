@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import secrets
 import socket
+import threading
 import time
 
 import paramiko
@@ -198,6 +199,97 @@ def open_sftp(client: paramiko.SSHClient, server: str, password: str) -> paramik
         if not password:
             raise PermissionError("这台主机的 sudo 需要密码")
         return _start_sftp_with_password(transport, server, password)
+
+
+def _quote_shell(text: str) -> str:
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def exec_su(client: paramiko.SSHClient, script: str, password: str) -> tuple[int, str]:
+    """Run one shell snippet as root. The password is used for this command and not retained."""
+    if not password or any(char in password for char in ("\r", "\n", "\0")):
+        raise ValueError("请填写有效的 root 密码")
+    if "\x00" in script:
+        raise ValueError("命令无效")
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise ConnectionError("连接已断开")
+    ready = "RF_SU_" + secrets.token_hex(8)
+    done = "RF_RM_" + secrets.token_hex(8)
+    body = (
+        f'test "$(/usr/bin/id -u)" = 0 && echo {ready} >&2 && '
+        f"{script}; printf '%s\\n' {done}:$?"
+    )
+    command = f"PATH=/usr/bin:/bin LC_ALL=C su -s /bin/sh -c {_quote_shell(body)} root"
+    try:
+        stdin, _stdout, _stderr = client.exec_command(command, timeout=20)
+    except (socket.timeout, TimeoutError, paramiko.SSHException, OSError) as exc:
+        raise ConnectionError(f"无法通过 su 执行删除：{exc}") from exc
+    channel = stdin.channel
+    try:
+        sent = False
+        pending = ""
+        deadline = time.monotonic() + 20
+        while ready not in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError("su 认证超时。请检查服务器是否要求交互终端或额外认证。")
+            channel.settimeout(remaining)
+            try:
+                chunk = channel.recv_stderr(4096)
+            except (socket.timeout, TimeoutError):
+                continue
+            if not chunk:
+                lower = pending.lower()
+                if "terminal" in lower or "tty" in lower:
+                    raise ConnectionError("这台主机的 su 要求交互终端，无法在这里完成删除")
+                raise PermissionError("su 认证失败，请检查 root 密码和当前账号的 su 权限")
+            pending += chunk.decode("utf-8", errors="replace")
+            if len(pending) > 16384 and ready not in pending:
+                raise ConnectionError("su 返回了无法识别的认证提示")
+            if pending.rstrip().endswith("Password:"):
+                if sent:
+                    raise PermissionError("su 未接受本次 root 认证")
+                channel.sendall((password + "\n").encode("utf-8"))
+                pending = ""
+                sent = True
+        tail = pending.split(ready, 1)[1]
+        errors: list[bytes] = [tail.encode("utf-8", errors="replace")] if tail.strip() else []
+
+        def drain() -> None:
+            while True:
+                try:
+                    data = channel.recv_stderr(4096)
+                except Exception:
+                    return
+                if not data:
+                    return
+                errors.append(data)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        channel.settimeout(None)
+        output = bytearray()
+        while True:
+            data = channel.recv(65536)
+            if not data:
+                break
+            output.extend(data)
+        reader.join(timeout=5)
+        code = None
+        prefix = done + ":"
+        for line in output.decode("utf-8", errors="replace").splitlines():
+            if line.startswith(prefix):
+                try:
+                    code = int(line[len(prefix):].strip())
+                except ValueError:
+                    code = None
+        if code is None:
+            raise ConnectionError("su 未能完成删除")
+        detail = b"".join(errors).decode("utf-8", errors="replace")
+        return code, detail
+    finally:
+        _close_channel(channel)
 
 
 def open_su_sftp(client: paramiko.SSHClient, server: str, password: str) -> paramiko.SFTPClient:

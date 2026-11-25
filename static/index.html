@@ -63,7 +63,27 @@
         <span id="upload-text"></span>
         <div id="upload-meter" aria-hidden="true"><div id="upload-fill"></div></div>
       </div>
-      <footer id="status">选择左侧连接，或新建一台主机。</footer>
+      <footer id="status-bar">
+        <span id="status">选择左侧连接，或新建一台主机。</span>
+        <div id="monitor">
+          <label class="monitor-toggle" title="显示这台主机的 CPU 和内存占用">
+            <input id="monitor-enabled" type="checkbox">
+            监控
+          </label>
+          <div id="monitor-meters" hidden>
+            <div class="meter" title="CPU 使用率">
+              <span class="meter-label">CPU</span>
+              <svg id="cpu-spark" class="spark" viewBox="0 0 64 16" aria-hidden="true"></svg>
+              <span id="cpu-value" class="meter-value">—</span>
+            </div>
+            <div class="meter" title="内存使用">
+              <span class="meter-label">内存</span>
+              <span class="meter-track" aria-hidden="true"><span id="mem-fill" class="meter-fill"></span></span>
+              <span id="mem-value" class="meter-value">—</span>
+            </div>
+          </div>
+        </div>
+      </footer>
     </main>
   </div>
   <div id="modal" hidden>

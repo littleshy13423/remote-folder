@@ -18,6 +18,7 @@ from paramiko.sftp_attr import SFTPAttributes
 
 from app.home import get_home
 from app.remote_path import is_directory, mode_string, parent_path, remote_join, safe_name, safe_relative
+from app import sudo as sudo_access
 
 
 MAX_UPLOAD_ITEMS = 5000
@@ -116,10 +117,27 @@ class _RmUnavailable(Exception):
     pass
 
 
-def delete_paths(sftp, paths: list[str], client=None, as_root: bool = False, sudo_password: str | None = None) -> dict:
+class RootPasswordRequired(Exception):
+    """Deletion needs a root shell. Callers should ask for a password and retry with rm."""
+
+
+def delete_paths(
+    sftp,
+    paths: list[str],
+    client=None,
+    as_root: bool = False,
+    sudo_password: str | None = None,
+    root_password: str | None = None,
+    root_method: str | None = None,
+) -> dict:
     if not paths:
         raise ValueError("请选择要删除的项目")
     targets = [_delete_target(sftp, path) for path in paths]
+    if root_method:
+        if client is None:
+            raise ConnectionError("无法执行 rm")
+        _rm_as_root(client, targets, root_method, root_password or "")
+        return {"ok": True}
     if client is not None:
         try:
             for batch in _batches(targets, 200):
@@ -127,9 +145,25 @@ def delete_paths(sftp, paths: list[str], client=None, as_root: bool = False, sud
             return {"ok": True}
         except _RmUnavailable:
             pass
+        except PermissionError:
+            if as_root:
+                raise
+            raise RootPasswordRequired() from None
     for current in targets:
         _remove(sftp, current)
     return {"ok": True}
+
+
+def _rm_as_root(client, paths: list[str], method: str, password: str) -> None:
+    if method not in ("sudo", "su"):
+        raise ValueError("未知的管理员认证方式")
+    if method == "su":
+        for batch in _batches(paths, 200):
+            code, detail = sudo_access.exec_su(client, remove_command(batch), password)
+            _raise_rm_status(code, detail)
+        return
+    for batch in _batches(paths, 200):
+        _rm(client, batch, True, password or None)
 
 
 def remove_command(paths: list[str], as_root: bool = False, sudo_password: str | None = None) -> str:
@@ -202,12 +236,26 @@ def _rm(client, paths: list[str], as_root: bool, sudo_password: str | None) -> N
     if code == 127 or "command not found" in lowered:
         raise _RmUnavailable()
     if code not in (0, None):
-        message = _rm_message(detail, code)
-        if "permission denied" in lowered or "operation not permitted" in lowered or "not permitted" in lowered:
-            raise PermissionError(message)
-        if "no such file" in lowered:
-            raise FileNotFoundError(message)
-        raise OSError(message)
+        _raise_rm_status(code, detail)
+
+
+def _raise_rm_status(code: int, detail: str) -> None:
+    if code in (0, None):
+        return
+    lowered = detail.lower()
+    if (
+        "sorry" in lowered
+        or "incorrect password" in lowered
+        or "password is required" in lowered
+        or "authentication failure" in lowered
+    ):
+        raise PermissionError(sudo_access.explain_sudo_failure(detail, code) or "sudo 密码不正确")
+    message = _rm_message(detail, code)
+    if "permission denied" in lowered or "operation not permitted" in lowered or "not permitted" in lowered:
+        raise PermissionError(message)
+    if "no such file" in lowered:
+        raise FileNotFoundError(message)
+    raise OSError(message)
 
 
 def _read_all(stream, sink: list[bytes]) -> None:

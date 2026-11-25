@@ -12,6 +12,8 @@ import time
 import paramiko
 from paramiko.sftp import SFTP_OK
 
+from app.stats import STATS_COMMAND
+
 
 class Auth(paramiko.ServerInterface):
     def __init__(self, username: str, password: str, root: str, commands: list[list[str]]) -> None:
@@ -19,6 +21,10 @@ class Auth(paramiko.ServerInterface):
         self.password = password
         self.root = root
         self.commands = commands
+        self.stats_n = 0
+        # Paramiko only keeps channels in a weak map. Dropping them runs
+        # Channel.__del__, which can reset the transport during a later request.
+        self._channels: list = []
 
     def check_channel_request(self, kind, chanid):
         if kind == "session":
@@ -31,6 +37,7 @@ class Auth(paramiko.ServerInterface):
         return paramiko.AUTH_FAILED
 
     def check_channel_exec_request(self, channel, command):
+        self._channels.append(channel)
         text = command.decode("utf-8", errors="replace") if isinstance(command, bytes) else str(command)
         if text.startswith("tar -xf - -C "):
             try:
@@ -47,6 +54,9 @@ class Auth(paramiko.ServerInterface):
             except ValueError:
                 return False
             threading.Thread(target=self._pack_download, args=(channel, pairs), daemon=True).start()
+            return True
+        if text.strip() == STATS_COMMAND:
+            threading.Thread(target=self._stats, args=(channel,), daemon=True).start()
             return True
         prefix = "rm -rf -- "
         if not text.startswith(prefix):
@@ -130,6 +140,39 @@ class Auth(paramiko.ServerInterface):
             channel.send_exit_status(code)
         except Exception:
             pass
+        try:
+            channel.close()
+        except Exception:
+            pass
+
+    def _stats(self, channel) -> None:
+        # Let the transport finish the exec reply before writing. A fast
+        # close here can arrive before CHANNEL_SUCCESS and drop the sample.
+        time.sleep(0.05)
+        self.stats_n += 1
+        n = self.stats_n
+        body = (
+            f"cpu  {100 * n} 0 {100 * n} {800 * n} 0 0 0 0\n"
+            "cpu0 1 0 1 1 0 0 0 0\n"
+            "MemTotal:        8000000 kB\n"
+            "MemFree:         1000000 kB\n"
+            "MemAvailable:    4000000 kB\n"
+            "Buffers:          100000 kB\n"
+            "Cached:          1000000 kB\n"
+        ).encode()
+        try:
+            view = memoryview(body)
+            while view:
+                sent = channel.send(view[:65536])
+                if not sent:
+                    break
+                view = view[sent:]
+            channel.send_exit_status(0)
+        except Exception:
+            try:
+                channel.send_exit_status(1)
+            except Exception:
+                pass
         try:
             channel.close()
         except Exception:

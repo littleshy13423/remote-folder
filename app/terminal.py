@@ -5,24 +5,51 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 
 from app.home import get_home
 from app.pool import pool
+from app import store
 
 
 def open_bash(session_id: str, session: dict, path: str) -> dict:
     remote = pool.call(session_id, lambda live: _directory(live, path))
-    argv = command_args(session, remote)
+    password = _terminal_password(session_id, session)
+    argv = command_args(session, remote, auto_password=password is not None)
     record = os.environ.get("RF_TERMINAL_DRY_RUN")
     if record:
-        Path(record).write_text(json.dumps({"argv": argv, "path": remote}, ensure_ascii=False), encoding="utf-8")
-    else:
-        subprocess.Popen(argv, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-    return {"ok": True, "path": remote, "message": _message(session)}
+        Path(record).write_text(
+            json.dumps({"argv": argv, "path": remote, "askpass": password is not None}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return {"ok": True, "path": remote, "message": _message(session, password is not None)}
+    env = None
+    askpass_dir = None
+    if password is not None:
+        askpass_dir, program = _write_askpass()
+        env = os.environ.copy()
+        env["SSH_ASKPASS"] = str(program)
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env.setdefault("DISPLAY", "localhost:0")
+        env["RF_SSH_PASSWORD"] = password
+    try:
+        process = subprocess.Popen(
+            argv,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+    except Exception:
+        if askpass_dir is not None:
+            shutil.rmtree(askpass_dir, ignore_errors=True)
+        raise
+    if askpass_dir is not None:
+        threading.Thread(target=_remove_askpass, args=(process, askpass_dir), daemon=True).start()
+    return {"ok": True, "path": remote, "message": _message(session, password is not None)}
 
 
-def command_args(session: dict, path: str) -> list[str]:
+def command_args(session: dict, path: str, auto_password: bool = False) -> list[str]:
     host = str(session.get("host") or "").strip()
     username = str(session.get("username") or "").strip()
     if not host or not username or any(_bad_token(item) for item in (host, username)):
@@ -46,6 +73,8 @@ def command_args(session: dict, path: str) -> list[str]:
     ]
     if auth == "password":
         argv.extend(["-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive"])
+        if auto_password:
+            argv.extend(["-o", "StrictHostKeyChecking=accept-new", "-o", "NumberOfPasswordPrompts=1"])
     elif auth == "key":
         key_path = str(session.get("keyPath") or "")
         if not key_path or not Path(key_path).is_file():
@@ -72,8 +101,45 @@ def _directory(live, path: str) -> str:
     return remote
 
 
-def _message(session: dict) -> str:
+def _terminal_password(session_id: str, session: dict) -> str | None:
+    if (session.get("auth") or "password") != "password":
+        return None
+    secret = pool.login_password(session_id) or store.get_secret(session_id, "password")
+    if not secret or any(character in secret for character in "\r\n\0"):
+        return None
+    return secret
+
+
+def _write_askpass() -> tuple[Path, Path]:
+    directory = Path(tempfile.mkdtemp(prefix="rf-askpass-"))
+    if os.name == "nt":
+        program = directory / "askpass.cmd"
+        program.write_text(
+            "@echo off\r\n"
+            "powershell.exe -NoProfile -NonInteractive -Command "
+            "\"$b=[Text.Encoding]::UTF8.GetBytes($env:RF_SSH_PASSWORD+[char]10);"
+            "[Console]::OpenStandardOutput().Write($b,0,$b.Length)\"\r\n",
+            encoding="ascii",
+        )
+    else:
+        program = directory / "askpass.sh"
+        program.write_text("#!/bin/sh\nprintf '%s\\n' \"$RF_SSH_PASSWORD\"\n", encoding="utf-8")
+        program.chmod(0o700)
+    return directory, program
+
+
+def _remove_askpass(process: subprocess.Popen, directory: Path) -> None:
+    try:
+        process.wait()
+    except Exception:
+        pass
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _message(session: dict, auto_password: bool = False) -> str:
     auth = session.get("auth") or "password"
+    if auth == "password" and auto_password:
+        return "已打开 bash，并进入当前目录。"
     if auth == "password":
         return "已打开 bash，并进入当前目录。终端里会再问一次密码。"
     if auth == "key":

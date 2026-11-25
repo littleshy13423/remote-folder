@@ -40,11 +40,28 @@ def main() -> None:
             size_one,
             upload_tar_command,
         )
+        from app.stats import STATS_COMMAND, consume_cpu, forget, interpret, parse_snapshot
         from app.sudo import explain_sudo_failure, match_sftp_server, sudo_password_command
         from app.terminal import remote_command, shell_quote
         from fastapi.testclient import TestClient
         import stat
 
+        expect(STATS_COMMAND == "cat /proc/stat /proc/meminfo", "stats command changed")
+        sample = "cpu  100 0 100 800 0 0 0 0\nMemTotal: 8000000 kB\nMemAvailable: 4000000 kB\n"
+        counters, memory = parse_snapshot(sample)
+        expect(counters == (1000, 800), str(counters))
+        expect(memory["total"] == 8000000 * 1024 and memory["used"] == 4000000 * 1024, str(memory))
+        expect(memory["percent"] == 50.0, str(memory))
+        fallback = "cpu  10 0 10 80\nMemTotal: 1000 kB\nMemFree: 100 kB\nBuffers: 50 kB\nCached: 50 kB\n"
+        _, fallback_memory = parse_snapshot(fallback)
+        expect(fallback_memory["used"] == 800 * 1024 and fallback_memory["percent"] == 80.0, str(fallback_memory))
+        expect(parse_snapshot("nope")[1] is None, "garbage accepted as memory")
+        forget("cpu-test")
+        expect(consume_cpu("cpu-test", 1000, 800, now=0) is None, "first cpu sample should be a baseline")
+        expect(consume_cpu("cpu-test", 2000, 1600, now=2) == 20.0, "cpu delta")
+        expect(consume_cpu("cpu-test", 3000, 1600, now=30) is None, "stale cpu sample was used")
+        expect(consume_cpu("cpu-test", 1000, 900, now=31) is None, "cpu counters going backwards were used")
+        expect(interpret("cpu-test", None) == {"supported": False}, "empty stats snapshot accepted")
         expect(match_sftp_server("/usr/lib/openssh/sftp-server") == "/usr/lib/openssh/sftp-server", "sftp path rejected")
         expect(match_sftp_server("/tmp/evil") is None, "unexpected sftp path accepted")
         expect(explain_sudo_failure("user is not in the sudoers file", 1) == "这个账号不能使用 sudo", "sudoers message")
@@ -55,6 +72,96 @@ def main() -> None:
         expect(command.startswith("sudo -S -p RFSUDO -- /bin/sh -c "), "sudo command prefix")
         expect(shell_quote("/tmp/a'b") == "'/tmp/a'\"'\"'b'", "shell quote")
         expect(remove_command(["/tmp/a'b"]) == "rm -rf -- '/tmp/a'\"'\"'b'", remove_command(["/tmp/a'b"]))
+        from app.sudo import exec_su
+        from app.transfer import RootPasswordRequired, delete_paths
+
+        class DenyRm:
+            def exec_command(self, command, timeout=None):
+                channel = type("Channel", (), {"recv_exit_status": lambda self: 1, "shutdown_write": lambda self: None})()
+                stream = type("Stream", (), {
+                    "channel": channel,
+                    "write": lambda self, data: None,
+                    "flush": lambda self: None,
+                    "read": lambda self: b"rm: cannot remove '/sec': Permission denied\n",
+                })()
+                return stream, stream, stream
+
+        class NoWalk:
+            def normalize(self, path):
+                return path if path.startswith("/") else "/" + path
+
+            def lstat(self, path):
+                return type("Attr", (), {"st_mode": stat.S_IFREG | 0o644})()
+
+            def listdir_attr(self, path):
+                raise SystemExit("delete walked over SFTP")
+
+        try:
+            delete_paths(NoWalk(), ["/sec"], client=DenyRm())
+            raise SystemExit("root password was not requested")
+        except RootPasswordRequired:
+            pass
+
+        class SuClient:
+            def __init__(self):
+                self.password = ""
+                self.command = ""
+
+            def get_transport(self):
+                return type("Transport", (), {"is_active": lambda self: True})()
+
+            def exec_command(self, command, timeout=None):
+                self.command = command
+
+                def token(prefix):
+                    start = command.index(prefix)
+                    end = start + len(prefix)
+                    while end < len(command) and command[end] in "0123456789abcdef":
+                        end += 1
+                    return command[start:end]
+
+                channel = SuChannel(token("RF_SU_"), token("RF_RM_"), self)
+                stdin = type("Stdin", (), {"channel": channel})()
+                return stdin, None, None
+
+        class SuChannel:
+            def __init__(self, ready, done, client):
+                self.ready = ready
+                self.done = done
+                self.client = client
+                self.stderr = [b"Password: "]
+                self.stdout = []
+                self.sent = False
+
+            def settimeout(self, value):
+                return None
+
+            def recv_stderr(self, _size):
+                if self.stderr:
+                    return self.stderr.pop(0)
+                if self.sent:
+                    self.sent = False
+                    return (self.ready + "\n").encode("ascii")
+                return b""
+
+            def recv(self, _size):
+                if self.stdout:
+                    return self.stdout.pop(0)
+                self.stdout.append(b"")
+                return (self.done + ":0\n").encode("ascii")
+
+            def sendall(self, payload):
+                self.client.password = payload.decode("utf-8")
+                self.sent = True
+
+            def close(self):
+                return None
+
+        su = SuClient()
+        expect(delete_paths(NoWalk(), ["/tmp/a'b"], client=su, root_method="su", root_password="root-secret")["ok"] is True, "su rm failed")
+        expect(su.password == "root-secret\n", su.password)
+        expect("root-secret" not in su.command, "password was embedded in the su command")
+        expect("rm -rf --" in su.command and "/tmp/a" in su.command, su.command)
         expect(remove_command(["/data/box"], as_root=True, sudo_password="secret").startswith("sudo -S -p RFSUDO -- rm -rf -- "), "sudo rm")
         expect(upload_tar_command("/docs") == "tar -xf - -C '/docs'", upload_tar_command("/docs"))
         expect(upload_tar_command("/tmp/a'b") == "tar -xf - -C '/tmp/a'\"'\"'b'", upload_tar_command("/tmp/a'b"))
@@ -218,7 +325,9 @@ def main() -> None:
                 expect(script.status_code == 200, "script missing")
                 expect("新建文件夹" in script.text and "新建文件" in script.text, "create actions missing")
                 expect("传输中" in script.text and "focusSession" in script.text, "session switch missing")
+                expect("/stats" in script.text and "cpu-spark" in script.text, "resource monitor script missing")
                 expect("打开 bash" in page.text, "bash action missing")
+                expect("监控" in page.text and 'id="monitor-enabled"' in page.text, "resource monitor missing")
                 expect("下载记录" in page.text and "choose_save_path" in script.text, "download history entry missing")
 
                 def request(method: str, url: str, **kwargs):
@@ -266,6 +375,20 @@ def main() -> None:
                 expect(connected.status_code == 200, connected.text)
                 expect(connected.json()["home"] == "/", connected.text)
 
+                first_stats = request("GET", f"/api/sessions/{session_id}/stats")
+                expect(first_stats.status_code == 200, first_stats.text)
+                expect(first_stats.json()["supported"] is True, first_stats.text)
+                expect(first_stats.json()["cpu"] is None, first_stats.text)
+                expect(first_stats.json()["memory"]["percent"] == 50.0, first_stats.text)
+                second_stats = request("GET", f"/api/sessions/{session_id}/stats")
+                expect(second_stats.status_code == 200, second_stats.text)
+                expect(second_stats.json()["cpu"] == 20.0, second_stats.text)
+                expect(second_stats.json()["memory"]["used"] == 4000000 * 1024, second_stats.text)
+                for _ in range(8):
+                    polled = request("GET", f"/api/sessions/{session_id}/stats")
+                    expect(polled.status_code == 200 and polled.json()["cpu"] == 20.0, polled.text)
+                    expect(pool.connected(session_id), "resource monitor closed the session")
+
                 os.environ["RF_TERMINAL_DRY_RUN"] = str(home / "terminal.json")
                 bash_early = request(
                     "POST",
@@ -278,6 +401,10 @@ def main() -> None:
                 expect("PubkeyAuthentication=no" in bash_args, str(bash_args))
                 expect(bash_args[-1] == remote_command("/"), str(bash_args))
                 expect("-p" in bash_args and str(stub.port) in bash_args, str(bash_args))
+                bash_record = json.loads((home / "terminal.json").read_text(encoding="utf-8"))
+                expect(bash_record["askpass"] is True, str(bash_record))
+                expect("s3cret-token" not in bash_record.__repr__(), "terminal record contains the password")
+                expect("StrictHostKeyChecking=accept-new" in bash_args, str(bash_args))
 
                 listed = request("GET", f"/api/sessions/{session_id}/list")
                 expect(listed.status_code == 200, listed.text)
@@ -318,6 +445,7 @@ def main() -> None:
                 expect("IdentitiesOnly=yes" in bash_key_args, str(bash_key_args))
                 expect(any(str(item).endswith("id_ed25519") for item in bash_key_args), str(bash_key_args))
                 expect(bash_key_args[-1] == remote_command("/docs"), str(bash_key_args))
+                expect(json.loads((home / "terminal.json").read_text(encoding="utf-8"))["askpass"] is False, "key login asked for a password")
 
                 created = request(
                     "POST",
