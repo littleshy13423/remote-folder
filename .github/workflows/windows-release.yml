@@ -105,14 +105,7 @@ jobs:
           sed -i 's/\r$//' dist/SHA256SUMS.txt
           (cd dist && sha256sum --check SHA256SUMS.txt) || fail "SHA256 check failed for remote-folder.exe"
           if gh release view "$RELEASE_TAG" --json isDraft,assets >/tmp/release.json 2>/tmp/release.err; then
-            state=$(python3 - <<'PY'
-import json
-data = json.load(open("/tmp/release.json"))
-names = sorted(asset.get("name", "") for asset in data.get("assets") or [])
-kind = "draft" if data.get("isDraft") else "published"
-print(kind + ":" + ",".join(names))
-PY
-)
+            state=$(python3 -c 'import json; data=json.load(open("/tmp/release.json")); names=sorted(a.get("name","") for a in (data.get("assets") or [])); kind="draft" if data.get("isDraft") else "published"; print(kind + ":" + ",".join(names))')
             echo "Existing release: $state"
             kind=${state%%:*}
             names=${state#*:}
