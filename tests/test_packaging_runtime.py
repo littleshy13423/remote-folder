@@ -65,7 +65,7 @@ class WindowsRuntimeTests(unittest.TestCase):
         from app.desktop import DesktopBridge
 
         bridge = DesktopBridge()
-        with patch.object(os, 'name', 'posix'), patch('app.desktop.subprocess.run', side_effect=OSError('missing')):
+        with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch('app.desktop.subprocess.run', side_effect=OSError('missing')):
             self.assertEqual(bridge.double_click_time_ms(), 400)
 
     def test_linux_save_dialog_uses_the_window(self):
@@ -87,7 +87,7 @@ class WindowsRuntimeTests(unittest.TestCase):
         note = Path('note.txt')
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('RF_OPEN_DRY_RUN', None)
-            with patch.object(os, 'name', 'posix'), patch('app.shell_open.subprocess.run', return_value=SimpleNamespace(returncode=0, stderr='', stdout='')) as run:
+            with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch('app.shell_open.subprocess.run', return_value=SimpleNamespace(returncode=0, stderr='', stdout='')) as run:
                 open_default(note)
         command = run.call_args.args[0]
         self.assertTrue(str(command[0]).endswith('xdg-open'))
@@ -100,9 +100,38 @@ class WindowsRuntimeTests(unittest.TestCase):
             return '/usr/bin/zenity' if name == 'zenity' else None
 
         completed = SimpleNamespace(returncode=0, stdout='/home/a/key\n')
-        with patch.object(os, 'name', 'posix'), patch('app.pick_file.shutil.which', side_effect=which), patch('app.pick_file.subprocess.run', return_value=completed) as run:
+        with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch('app.pick_file.shutil.which', side_effect=which), patch('app.pick_file.subprocess.run', return_value=completed) as run:
             self.assertEqual(pick_file(), '/home/a/key')
         self.assertEqual(run.call_args.args[0][0], 'zenity')
+
+    def test_mac_open_uses_the_open_command(self):
+        from app.shell_open import open_default
+
+        note = Path('note.txt')
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('RF_OPEN_DRY_RUN', None)
+            with patch.object(sys, 'platform', 'darwin'), patch('app.shell_open.subprocess.run', return_value=SimpleNamespace(returncode=0, stderr='', stdout='')) as run:
+                open_default(note)
+        self.assertEqual(run.call_args.args[0], ['open', str(note)])
+
+    def test_mac_file_picker_uses_osascript(self):
+        from app.pick_file import pick_file
+
+        completed = SimpleNamespace(returncode=0, stdout='/Users/a/key\n')
+        with patch.object(sys, 'platform', 'darwin'), patch('app.pick_file.subprocess.run', return_value=completed) as run:
+            self.assertEqual(pick_file(), '/Users/a/key')
+        self.assertEqual(run.call_args.args[0][0], 'osascript')
+
+    def test_mac_starts_cocoa_without_windows_runtime(self):
+        pythonnet = SimpleNamespace(load=Mock())
+        webview = SimpleNamespace(settings={}, create_window=Mock(return_value=None), start=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with patch.object(sys, 'platform', 'darwin'), patch.object(os, 'name', 'posix'), patch.dict(sys.modules, {'pythonnet': pythonnet, 'webview': webview}), patch.dict(os.environ), patch.object(desktop, 'get_home', return_value=home), patch.object(desktop.logging, 'basicConfig'), patch.object(desktop, 'sweep_cache'), patch.object(desktop, 'choose_port', return_value=8765), patch.object(desktop, 'start_server', return_value=SimpleNamespace(should_exit=False)), patch.object(desktop, 'wait_until_ready'):
+                desktop.main()
+                self.assertEqual(os.environ.get('PYWEBVIEW_GUI'), 'cocoa')
+        webview.start.assert_called_once_with(gui='cocoa')
+        pythonnet.load.assert_not_called()
 
 
 if __name__ == '__main__':

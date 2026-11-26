@@ -11,7 +11,8 @@
 打开 [最新 Release](https://github.com/littleshy13423/remote-folder/releases/latest)。
 
 - Windows 10/11 64 位：下载 **remote-folder.exe**，双击运行。程序使用系统 WebView2，不把完整浏览器打进文件里。缺少时可安装[微软 WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download)。
-- Linux x64（Ubuntu 22.04 或更新）：下载 **remote-folder-linux-x64**。它使用系统的 GTK 3 和 WebKitGTK。Ubuntu 22.04 安装 `libgtk-3-0` 和 `libwebkit2gtk-4.0-37`；Ubuntu 24.04 若没有 4.0，安装 `libwebkit2gtk-4.1-0`。下载后执行 `chmod +x remote-folder-linux-x64`，再运行这个文件。
+- Mac（Apple 芯片，macOS 14 或更新）：下载 **remote-folder-macos-arm64.zip**，解压后打开 `remote-folder.app`。它使用系统 WebKit。首次打开若被拦截，在终端执行 `xattr -dr com.apple.quarantine remote-folder.app`。Intel 芯片的 Mac 不能用这个文件。
+- Linux x64（Ubuntu 22.04 或更新）：下载 **remote-folder-linux-x64**。它使用系统的 GTK 3 和 WebKitGTK，不能在 Mac 上运行。Ubuntu 22.04 安装 `libgtk-3-0` 和 `libwebkit2gtk-4.0-37`；Ubuntu 24.04 若没有 4.0，安装 `libwebkit2gtk-4.1-0`。下载后执行 `chmod +x remote-folder-linux-x64`，再运行这个文件。
 - 单个程序已包含 Python 和应用依赖，无需安装 Python、下载源码或保留 `_internal` 文件夹。
 - 启动时会自动解压内置组件，等待窗口出现即可。程序会打开自己的窗口，关掉窗口就退出。
 - 连接配置保存在用户目录的 `.remote-folder` 中；更新时替换程序文件即可保留配置。
@@ -25,7 +26,7 @@
 
 ## 开发与打包
 
-开发时在 Windows 上双击 `run.bat`。Windows 打包需要 Windows 和 Python 3.11 x64，在 PowerShell 中运行 `./build.ps1`，生成 `dist/remote-folder.exe`。Linux x64 打包运行 `./build.sh`，生成 `dist/remote-folder-linux-x64`。这些准备工作只在构建机器上执行，使用者只需下载最终程序。
+开发时在 Windows 上双击 `run.bat`。Windows 打包运行 `./build.ps1`，生成 `dist/remote-folder.exe`。Linux x64 打包运行 `./build.sh`，生成 `dist/remote-folder-linux-x64`。Mac 打包运行 `./build-mac.sh`，生成 `dist/remote-folder-macos-<芯片>.zip`。这些准备工作只在对应系统上执行，使用者只需下载最终程序。
 
 ## 发布新版本
 

@@ -81,6 +81,13 @@ def show_error(message: str) -> None:
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(None, message, "remote-folder", 0x10)
         return
+    if sys.platform == "darwin":
+        safe = message.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            subprocess.Popen(["osascript", "-e", f'display alert "remote-folder" message "{safe}"'])
+        except OSError:
+            pass
+        return
     try:
         subprocess.Popen(["zenity", "--error", "--title=remote-folder", f"--text={message}"])
     except OSError:
@@ -139,8 +146,9 @@ def main() -> None:
     try:
         configure_windows_runtime()
         prefer_system_typelibs()
-        if window_gui() == "gtk":
-            os.environ["PYWEBVIEW_GUI"] = "gtk"
+        gui = window_gui()
+        if gui != "edgechromium":
+            os.environ["PYWEBVIEW_GUI"] = gui
         import webview
 
         webview.settings["ALLOW_DOWNLOADS"] = True

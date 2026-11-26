@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -16,6 +17,9 @@ _ERROR_NO_ASSOCIATION = 1155
 def open_default(path: Path) -> None:
     if _record("open", path):
         return
+    if sys.platform == "darwin":
+        _mac_open(path)
+        return
     if os.name != "nt":
         _xdg_open(path)
         return
@@ -25,6 +29,16 @@ def open_default(path: Path) -> None:
         if getattr(exc, "winerror", None) == _ERROR_NO_ASSOCIATION:
             raise OSError("这个后缀还没有关联程序。请右键该文件，选择「打开方式」。") from exc
         raise OSError(f"无法打开：{exc}") from exc
+
+
+def _mac_open(path: Path) -> None:
+    try:
+        result = subprocess.run(["open", str(path)], check=False, capture_output=True, text=True)
+    except OSError as exc:
+        raise OSError("无法用系统默认程序打开这个文件。") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OSError(detail or "无法用系统默认程序打开这个文件。")
 
 
 def _xdg_open(path: Path) -> None:

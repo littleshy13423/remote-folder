@@ -3,12 +3,33 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 
 
 def pick_file() -> str | None:
+    if sys.platform == "darwin":
+        return _pick_mac()
     if os.name != "nt":
         return _pick_posix()
     return _pick_windows()
+
+
+def _pick_mac() -> str | None:
+    script = 'POSIX path of (choose file with prompt "选择文件")'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    path = (result.stdout or "").strip()
+    if result.returncode == 0 and path:
+        return path
+    return None
 
 
 def _pick_posix() -> str | None:

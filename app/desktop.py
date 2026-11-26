@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+import sys
 import threading
 
 from app import downloads
@@ -13,6 +14,8 @@ class DesktopBridge:
         self._window = None
 
     def double_click_time_ms(self) -> int:
+        if sys.platform == "darwin":
+            return _mac_double_click_time()
         if os.name != "nt":
             return _linux_double_click_time()
         return ctypes.windll.user32.GetDoubleClickTime()
@@ -137,6 +140,24 @@ def _run_on_gui(fn):
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+def _mac_double_click_time() -> int:
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "-g", "com.apple.mouse.doubleClickThreshold"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        seconds = float((result.stdout or "").strip())
+        millis = int(seconds * 1000)
+        if 100 <= millis <= 2000:
+            return millis
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return 500
 
 
 def _linux_double_click_time() -> int:

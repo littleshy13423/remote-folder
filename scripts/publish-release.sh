@@ -1,27 +1,30 @@
 #!/bin/bash
-# Publish the Windows EXE and Linux binary for one version tag.
+# Publish the Windows, Linux, and macOS downloads for one version tag.
 set -euo pipefail
 fail() { echo "::error::$1"; echo "$1" >&2; exit 1; }
 
 [[ "${RELEASE_TAG:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Use a version tag such as v0.1.0"
 test -f dist/windows/remote-folder.exe
 test -f dist/linux/remote-folder-linux-x64
-sed -i 's/\r$//' dist/windows/SHA256SUMS.txt dist/linux/SHA256SUMS.txt
+test -f dist/macos/remote-folder-macos-arm64.zip
+sed -i 's/\r$//' dist/windows/SHA256SUMS.txt dist/linux/SHA256SUMS.txt dist/macos/SHA256SUMS.txt
 (cd dist/windows && sha256sum --check SHA256SUMS.txt) || fail "SHA256 check failed for remote-folder.exe"
 (cd dist/linux && sha256sum --check SHA256SUMS.txt) || fail "SHA256 check failed for remote-folder-linux-x64"
+(cd dist/macos && sha256sum --check SHA256SUMS.txt) || fail "SHA256 check failed for remote-folder-macos-arm64.zip"
 
 stage=$(mktemp -d)
-cp dist/windows/remote-folder.exe dist/linux/remote-folder-linux-x64 "$stage/"
+cp dist/windows/remote-folder.exe dist/linux/remote-folder-linux-x64 dist/macos/remote-folder-macos-arm64.zip "$stage/"
 chmod +x "$stage/remote-folder-linux-x64"
 (
   cd "$stage"
-  sha256sum remote-folder.exe remote-folder-linux-x64 > SHA256SUMS.txt
+  sha256sum remote-folder.exe remote-folder-linux-x64 remote-folder-macos-arm64.zip > SHA256SUMS.txt
   sha256sum --check SHA256SUMS.txt
 )
 
 files=(
   "$stage/remote-folder.exe"
   "$stage/remote-folder-linux-x64"
+  "$stage/remote-folder-macos-arm64.zip"
   "$stage/SHA256SUMS.txt"
 )
 if gh release view "$RELEASE_TAG" --json isDraft,assets >/tmp/release.json 2>/tmp/release.err; then
