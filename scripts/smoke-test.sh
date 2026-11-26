@@ -3,7 +3,7 @@
 set -eu
 if [ -z "${RF_SMOKE_READY:-}" ]; then
   export RF_SMOKE_READY=1
-  exec dbus-run-session -- xvfb-run -a "$0" "$@"
+  exec dbus-run-session -- xvfb-run -a bash "$0" "$@"
 fi
 
 BIN=${1:-dist/remote-folder-linux-x64}
@@ -52,7 +52,11 @@ deadline=$(( $(date +%s) + TIMEOUT ))
 ready=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
   if ! kill -0 "$PID" 2>/dev/null; then
-    echo "Linux binary exited before startup completed." >&2
+    set +e
+    wait "$PID"
+    code=$?
+    set -e
+    echo "::error::Linux binary exited before startup completed with code $code"
     exit 1
   fi
   if [ -f "$LOG" ] && grep -q 'GET /api/sessions HTTP/1.1" 200' "$LOG"; then
