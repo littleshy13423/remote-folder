@@ -211,6 +211,8 @@ def reveal_download(body: RevealBody):
         raise APIError(404, "文件已经不在原来的位置")
     if os.name == "nt":
         subprocess.Popen(["explorer", f"/select,{path}"])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path])
     else:
         subprocess.Popen(["xdg-open", os.path.dirname(path)])
     return {"ok": True}

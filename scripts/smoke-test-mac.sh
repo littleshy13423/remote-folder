@@ -74,8 +74,6 @@ for asset in app.js file-icons.js style.css; do
     exit 1
   fi
 done
-osascript -e 'tell application "System Events" to keystroke "q" using command down' >/dev/null 2>&1 || true
-sleep 2
 if kill -0 "$PID" 2>/dev/null; then
   kill "$PID" 2>/dev/null || true
   sleep 1

@@ -118,6 +118,8 @@ def _save_choice(result: object, error: object) -> dict:
 def _run_on_gui(fn):
     if threading.current_thread() is threading.main_thread():
         return fn()
+    if sys.platform == "darwin":
+        return _run_on_cocoa_main(fn)
     try:
         from gi.repository import GLib
     except Exception:
@@ -135,6 +137,52 @@ def _run_on_gui(fn):
         return False
 
     GLib.idle_add(run)
+    if not done.wait(180):
+        raise TimeoutError("窗口没有响应")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+_cocoa_caller = None
+
+
+def _run_on_cocoa_main(fn):
+    try:
+        from Foundation import NSObject
+        import objc
+    except Exception:
+        return fn()
+    global _cocoa_caller
+    if _cocoa_caller is None:
+
+        class Caller(NSObject):
+            def initWithCallback_(self, callback):
+                self = objc.super(Caller, self).init()
+                if self is None:
+                    return None
+                self.callback = callback
+                return self
+
+            def call_(self, _sender) -> None:
+                callback = self.callback
+                self.callback = None
+                callback()
+
+        _cocoa_caller = Caller
+    box: dict[str, object] = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            done.set()
+
+    caller = _cocoa_caller.alloc().initWithCallback_(run)
+    caller.performSelectorOnMainThread_withObject_waitUntilDone_("call:", None, False)
     if not done.wait(180):
         raise TimeoutError("窗口没有响应")
     if "error" in box:
