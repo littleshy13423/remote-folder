@@ -4,6 +4,7 @@ import ctypes
 import logging
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -76,8 +77,38 @@ def wait_until_ready(port: int) -> None:
 
 def show_error(message: str) -> None:
     logging.exception(message) if sys.exc_info()[0] else logging.error(message)
+    print(message, file=sys.stderr)
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(None, message, "remote-folder", 0x10)
+        return
+    try:
+        subprocess.Popen(["zenity", "--error", "--title=remote-folder", f"--text={message}"])
+    except OSError:
+        pass
+
+
+def window_gui() -> str:
+    if sys.platform == "win32":
+        return "edgechromium"
+    if sys.platform == "darwin":
+        return "cocoa"
+    return "gtk"
+
+
+def prefer_system_typelibs() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    candidates = [
+        "/usr/lib/x86_64-linux-gnu/girepository-1.0",
+        "/usr/lib64/girepository-1.0",
+        "/usr/lib/girepository-1.0",
+    ]
+    found = [path for path in candidates if os.path.isdir(path)]
+    if not found:
+        return
+    extra = os.pathsep.join(found)
+    current = os.environ.get("GI_TYPELIB_PATH", "")
+    os.environ["GI_TYPELIB_PATH"] = extra if not current else extra + os.pathsep + current
 
 
 def configure_windows_runtime() -> None:
@@ -107,12 +138,17 @@ def main() -> None:
     )
     try:
         configure_windows_runtime()
+        prefer_system_typelibs()
+        if window_gui() == "gtk":
+            os.environ["PYWEBVIEW_GUI"] = "gtk"
         import webview
 
         webview.settings["ALLOW_DOWNLOADS"] = True
     except ImportError:
         if getattr(sys, "frozen", False):
             show_error("窗口组件没有随程序一起打包。")
+        elif sys.platform.startswith("linux"):
+            show_error("缺少窗口组件。请安装 GTK 3 和 WebKitGTK 后再运行。")
         else:
             show_error("缺少窗口组件。请在项目目录重新运行 run.bat。")
         raise SystemExit(1)
@@ -139,7 +175,7 @@ def main() -> None:
         bridge._window = window
         if window is not None:
             window.events.closed += lambda: setattr(server, "should_exit", True)
-        webview.start(gui="edgechromium")
+        webview.start(gui=window_gui())
     except Exception as exc:
         show_error(f"窗口没有打开：{exc}")
         raise SystemExit(1)

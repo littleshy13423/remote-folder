@@ -1136,7 +1136,7 @@ async function showDownloadHistory() {
   const items = data.items || [];
   await openDialog({
     title: "下载记录",
-    message: items.length ? "点一条可以在资源管理器里定位这个文件。" : "还没有下载记录。",
+    message: items.length ? "点一条可以在文件管理器里定位这个文件。" : "还没有下载记录。",
     hideCancel: true,
     okText: "关闭",
     build(body) {

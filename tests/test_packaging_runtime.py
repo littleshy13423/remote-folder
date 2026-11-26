@@ -50,6 +50,58 @@ class WindowsRuntimeTests(unittest.TestCase):
         self.assertIn('CLR unavailable', show_error.call_args.args[0])
         start_server.assert_not_called()
 
+    def test_linux_starts_gtk_without_windows_runtime(self):
+        pythonnet = SimpleNamespace(load=Mock())
+        webview = SimpleNamespace(settings={}, create_window=Mock(return_value=None), start=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch.dict(sys.modules, {'pythonnet': pythonnet, 'webview': webview}), patch.dict(os.environ), patch.object(desktop, 'get_home', return_value=Path(directory)), patch.object(desktop.logging, 'basicConfig'), patch.object(desktop, 'sweep_cache'), patch.object(desktop, 'choose_port', return_value=8765), patch.object(desktop, 'start_server', return_value=SimpleNamespace(should_exit=False)), patch.object(desktop, 'wait_until_ready'):
+                desktop.main()
+                self.assertEqual(os.environ.get('PYWEBVIEW_GUI'), 'gtk')
+        webview.start.assert_called_once_with(gui='gtk')
+        pythonnet.load.assert_not_called()
+
+    def test_linux_double_click_falls_back_when_gsettings_is_missing(self):
+        from app.desktop import DesktopBridge
+
+        bridge = DesktopBridge()
+        with patch.object(os, 'name', 'posix'), patch('app.desktop.subprocess.run', side_effect=OSError('missing')):
+            self.assertEqual(bridge.double_click_time_ms(), 400)
+
+    def test_linux_save_dialog_uses_the_window(self):
+        from app.desktop import DesktopBridge
+
+        bridge = DesktopBridge()
+        window = Mock()
+        window.create_file_dialog.return_value = ('/tmp/notes.zip',)
+        bridge._window = window
+        webview = SimpleNamespace(FileDialog=SimpleNamespace(SAVE='save'))
+        with patch.object(os, 'name', 'posix'), patch.dict(sys.modules, {'webview': webview}), patch('app.desktop.downloads.issue', return_value='tok'), patch('app.desktop.downloads.downloads_dir', return_value='/tmp'):
+            chosen = bridge.choose_save_path('notes.zip')
+        self.assertEqual(chosen, {'ok': True, 'token': 'tok', 'path': '/tmp/notes.zip'})
+        self.assertEqual(window.create_file_dialog.call_args.kwargs['save_filename'], 'notes.zip')
+
+    def test_posix_open_uses_xdg_open(self):
+        from app.shell_open import open_default
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('RF_OPEN_DRY_RUN', None)
+            with patch.object(os, 'name', 'posix'), patch('app.shell_open.subprocess.run', return_value=SimpleNamespace(returncode=0, stderr='', stdout='')) as run:
+                open_default(Path('/tmp/note.txt'))
+        command = run.call_args.args[0]
+        self.assertTrue(str(command[0]).endswith('xdg-open'))
+        self.assertEqual(command[1], '/tmp/note.txt')
+
+    def test_posix_file_picker_uses_zenity(self):
+        from app.pick_file import pick_file
+
+        def which(name):
+            return '/usr/bin/zenity' if name == 'zenity' else None
+
+        completed = SimpleNamespace(returncode=0, stdout='/home/a/key\n')
+        with patch.object(os, 'name', 'posix'), patch('app.pick_file.shutil.which', side_effect=which), patch('app.pick_file.subprocess.run', return_value=completed) as run:
+            self.assertEqual(pick_file(), '/home/a/key')
+        self.assertEqual(run.call_args.args[0][0], 'zenity')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import subprocess
+import threading
 
 from app import downloads
 
@@ -10,6 +13,8 @@ class DesktopBridge:
         self._window = None
 
     def double_click_time_ms(self) -> int:
+        if os.name != "nt":
+            return _linux_double_click_time()
         return ctypes.windll.user32.GetDoubleClickTime()
 
     def show_download_history(self) -> dict:
@@ -40,6 +45,8 @@ class DesktopBridge:
         return {"ok": True}
 
     def choose_save_path(self, filename: str = "") -> dict:
+        if os.name != "nt":
+            return self._choose_save_path_linux(filename)
         window = self._window
         form = getattr(window, "native", None) if window is not None else None
         if window is None or form is None:
@@ -67,12 +74,83 @@ class DesktopBridge:
                 ask()
         except Exception as exc:
             return {"ok": False, "error": str(exc) or "无法选择保存位置"}
-        if holder.get("error"):
-            return {"ok": False, "error": str(holder["error"])}
-        result = holder.get("result")
-        if not result:
-            return {"ok": False, "cancelled": True}
-        path = result[0] if isinstance(result, (list, tuple)) else str(result)
-        if not path:
-            return {"ok": False, "cancelled": True}
-        return {"ok": True, "token": downloads.issue(path), "path": path}
+        return _save_choice(holder.get("result"), holder.get("error"))
+
+    def _choose_save_path_linux(self, filename: str) -> dict:
+        window = self._window
+        if window is None:
+            return {"ok": False, "error": "窗口还没准备好"}
+        from webview import FileDialog
+
+        holder: dict[str, object] = {}
+
+        def ask() -> None:
+            try:
+                holder["result"] = window.create_file_dialog(
+                    FileDialog.SAVE,
+                    directory=downloads.downloads_dir(),
+                    save_filename=filename or "download",
+                )
+            except Exception as exc:
+                holder["error"] = str(exc) or "无法选择保存位置"
+
+        try:
+            _run_on_gui(ask)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc) or "无法选择保存位置"}
+        return _save_choice(holder.get("result"), holder.get("error"))
+
+
+def _save_choice(result: object, error: object) -> dict:
+    if error:
+        return {"ok": False, "error": str(error)}
+    if not result:
+        return {"ok": False, "cancelled": True}
+    path = result[0] if isinstance(result, (list, tuple)) else str(result)
+    if not path:
+        return {"ok": False, "cancelled": True}
+    return {"ok": True, "token": downloads.issue(path), "path": path}
+
+
+def _run_on_gui(fn):
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    try:
+        from gi.repository import GLib
+    except Exception:
+        return fn()
+    box: dict[str, object] = {}
+    done = threading.Event()
+
+    def run() -> bool:
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            done.set()
+        return False
+
+    GLib.idle_add(run)
+    if not done.wait(180):
+        raise TimeoutError("窗口没有响应")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _linux_double_click_time() -> int:
+    try:
+        result = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.peripherals.mouse", "double-click"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        value = int((result.stdout or "").strip())
+        if 100 <= value <= 2000:
+            return value
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return 400

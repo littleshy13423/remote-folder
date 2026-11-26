@@ -1,9 +1,35 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 
 
 def pick_file() -> str | None:
+    if os.name != "nt":
+        return _pick_posix()
+    return _pick_windows()
+
+
+def _pick_posix() -> str | None:
+    commands = (
+        ["zenity", "--file-selection", "--title=选择文件"],
+        ["kdialog", "--getopenfilename", "", "所有文件 (*)"],
+    )
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        path = (result.stdout or "").strip()
+        if result.returncode == 0 and path:
+            return path
+    return None
+
+
+def _pick_windows() -> str | None:
     script = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms

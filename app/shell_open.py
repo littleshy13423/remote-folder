@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -15,12 +16,26 @@ _ERROR_NO_ASSOCIATION = 1155
 def open_default(path: Path) -> None:
     if _record("open", path):
         return
+    if os.name != "nt":
+        _xdg_open(path)
+        return
     try:
         os.startfile(str(path))  # type: ignore[attr-defined]
     except OSError as exc:
         if getattr(exc, "winerror", None) == _ERROR_NO_ASSOCIATION:
             raise OSError("这个后缀还没有关联程序。请右键该文件，选择「打开方式」。") from exc
         raise OSError(f"无法打开：{exc}") from exc
+
+
+def _xdg_open(path: Path) -> None:
+    opener = shutil.which("xdg-open") or "xdg-open"
+    try:
+        result = subprocess.run([opener, str(path)], check=False, capture_output=True, text=True)
+    except OSError as exc:
+        raise OSError("无法打开这个文件。请确认系统已安装 xdg-open，并且这个后缀有默认程序。") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OSError(detail or "无法打开这个文件。请确认这个后缀有默认程序。")
 
 
 def choose_application(path: Path) -> bool:
