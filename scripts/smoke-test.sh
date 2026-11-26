@@ -59,8 +59,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     echo "::error::Linux binary exited before startup completed with code $code"
     exit 1
   fi
-  if [ -f "$LOG" ] && grep -q 'GET /api/sessions HTTP/1.1" 200' "$LOG"; then
-    if curl -fsS -H 'X-RF-Request: 1' "$BASE/api/health" | grep -q '"ok":true\|"ok": true'; then
+  if [ -f "$LOG" ] && grep -q 'GET / HTTP/1.1' "$LOG"; then
+    if curl -fsS -H 'X-RF-Request: 1' "$BASE/api/health" | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ok") else 1)'; then
       ready=1
       break
     fi
