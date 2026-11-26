@@ -44,18 +44,19 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Test application
         run: |
-          python tests/test_api.py *> test-api.log
-          $code = $LASTEXITCODE
-          Get-Content test-api.log -Tail 40
-          if ($code -ne 0) {
-            $tail = ((Get-Content test-api.log -Tail 15) -join " ")
-            Write-Host "::error::tests/test_api.py failed: $tail"
+          function Report-TestFailure($title, $log, $code) {
+            Get-Content $log -Tail 40
+            $tail = (((Get-Content $log -Tail 8) -join " | ") -replace '[^\x20-\x7E]', '?')
+            if ($tail.Length -gt 500) { $tail = $tail.Substring($tail.Length - 500) }
+            Write-Host "::error title=$title::$tail"
             exit $code
           }
-          python -m unittest discover -s tests -p 'test_packaging*.py' -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest discover -s tests -p 'test_pool_elevation.py' -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_api.py *> test-api.log
+          if ($LASTEXITCODE -ne 0) { Report-TestFailure "test_api" "test-api.log" $LASTEXITCODE }
+          python -m unittest discover -s tests -p 'test_packaging*.py' -v *> test-packaging.log
+          if ($LASTEXITCODE -ne 0) { Report-TestFailure "packaging" "test-packaging.log" $LASTEXITCODE }
+          python -m unittest discover -s tests -p 'test_pool_elevation.py' -v *> test-pool.log
+          if ($LASTEXITCODE -ne 0) { Report-TestFailure "pool" "test-pool.log" $LASTEXITCODE }
       - name: Build standalone EXE
         run: ./build.ps1 -Python python
       - name: Test packaged EXE outside the source directory

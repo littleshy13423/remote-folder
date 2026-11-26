@@ -4,9 +4,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python3}"
 note() { echo "::error::$1"; echo "$1" >&2; }
+tail_text() { tail -n 20 "$1" 2>/dev/null | tr '\n' ' ' | cut -c1-700 || true; }
 
-"$PYTHON" -m pip install -r requirements.txt "pyinstaller==6.22.3" "pygobject" "pycairo"
-"$PYTHON" -c "import struct, sys; assert sys.platform.startswith('linux') and struct.calcsize('P') == 8, '64-bit Linux Python is required'"
+if ! "$PYTHON" -m pip install -r requirements.txt "pyinstaller==6.22.3" "pygobject" "pycairo" > /tmp/remote-folder-pip.log 2>&1; then
+  note "pip install failed: $(tail_text /tmp/remote-folder-pip.log)"
+  exit 1
+fi
+if ! "$PYTHON" -c "import struct, sys; assert sys.platform.startswith('linux') and struct.calcsize('P') == 8, '64-bit Linux Python is required'" > /tmp/remote-folder-py.log 2>&1; then
+  note "Linux Python check failed: $(tail_text /tmp/remote-folder-py.log)"
+  exit 1
+fi
 if ! "$PYTHON" -m PyInstaller --noconfirm --clean remote-folder-linux.spec > /tmp/remote-folder-pyinstaller.log 2>&1; then
   tail -n 40 /tmp/remote-folder-pyinstaller.log >&2 || true
   message=$(tail -n 12 /tmp/remote-folder-pyinstaller.log | tr '\n' ' ' | cut -c1-700)
