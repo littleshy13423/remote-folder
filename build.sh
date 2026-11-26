@@ -6,7 +6,7 @@ PYTHON="${PYTHON:-python3}"
 note() { echo "::error::$1"; echo "$1" >&2; }
 tail_text() { tail -n 20 "$1" 2>/dev/null | tr '\n' ' ' | cut -c1-700 || true; }
 
-if ! "$PYTHON" -m pip install -r requirements.txt "pyinstaller==6.22.3" "pygobject" "pycairo" > /tmp/remote-folder-pip.log 2>&1; then
+if ! "$PYTHON" -m pip install -r requirements.txt "pyinstaller==6.22.3" "pygobject==3.48.2" "pycairo" > /tmp/remote-folder-pip.log 2>&1; then
   note "pip install failed: $(tail_text /tmp/remote-folder-pip.log)"
   exit 1
 fi

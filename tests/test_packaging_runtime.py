@@ -54,7 +54,8 @@ class WindowsRuntimeTests(unittest.TestCase):
         pythonnet = SimpleNamespace(load=Mock())
         webview = SimpleNamespace(settings={}, create_window=Mock(return_value=None), start=Mock())
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch.dict(sys.modules, {'pythonnet': pythonnet, 'webview': webview}), patch.dict(os.environ), patch.object(desktop, 'get_home', return_value=Path(directory)), patch.object(desktop.logging, 'basicConfig'), patch.object(desktop, 'sweep_cache'), patch.object(desktop, 'choose_port', return_value=8765), patch.object(desktop, 'start_server', return_value=SimpleNamespace(should_exit=False)), patch.object(desktop, 'wait_until_ready'):
+            home = Path(directory)
+            with patch.object(sys, 'platform', 'linux'), patch.object(os, 'name', 'posix'), patch.dict(sys.modules, {'pythonnet': pythonnet, 'webview': webview}), patch.dict(os.environ), patch.object(desktop, 'get_home', return_value=home), patch.object(desktop.logging, 'basicConfig'), patch.object(desktop, 'sweep_cache'), patch.object(desktop, 'choose_port', return_value=8765), patch.object(desktop, 'start_server', return_value=SimpleNamespace(should_exit=False)), patch.object(desktop, 'wait_until_ready'):
                 desktop.main()
                 self.assertEqual(os.environ.get('PYWEBVIEW_GUI'), 'gtk')
         webview.start.assert_called_once_with(gui='gtk')
@@ -83,13 +84,14 @@ class WindowsRuntimeTests(unittest.TestCase):
     def test_posix_open_uses_xdg_open(self):
         from app.shell_open import open_default
 
+        note = Path('note.txt')
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('RF_OPEN_DRY_RUN', None)
             with patch.object(os, 'name', 'posix'), patch('app.shell_open.subprocess.run', return_value=SimpleNamespace(returncode=0, stderr='', stdout='')) as run:
-                open_default(Path('/tmp/note.txt'))
+                open_default(note)
         command = run.call_args.args[0]
         self.assertTrue(str(command[0]).endswith('xdg-open'))
-        self.assertEqual(command[1], '/tmp/note.txt')
+        self.assertEqual(command[1], str(note))
 
     def test_posix_file_picker_uses_zenity(self):
         from app.pick_file import pick_file
