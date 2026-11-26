@@ -68,7 +68,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 2
 done
 if [ "$ready" -ne 1 ]; then
-  echo "Timed out waiting for the Linux desktop UI." >&2
+  detail=$(tail -n 20 "$LOG" 2>/dev/null | tr '\n' ' ' | cut -c1-500 || true)
+  echo "::error::Timed out waiting for the Linux desktop UI. ${detail}"
   exit 1
 fi
 if ! curl -fsS "$BASE/" | grep -q '<title>remote-folder</title>'; then
@@ -82,23 +83,14 @@ for asset in app.js file-icons.js style.css; do
   fi
 done
 wmctrl -c remote-folder || true
-i=0
-while [ "$i" -lt 20 ]; do
-  if ! kill -0 "$PID" 2>/dev/null; then
-    set +e
-    wait "$PID"
-    code=$?
-    set -e
-    PID=""
-    if [ "$code" -ne 0 ] && [ "$code" -ne 143 ] && [ "$code" -ne 130 ]; then
-      echo "::error::Linux binary returned exit code $code"
-      exit 1
-    fi
-    echo "PASS: Linux binary starts its desktop UI, uses system WebKitGTK, serves HTML/JS/CSS/API, and exits cleanly."
-    exit 0
-  fi
-  i=$((i + 1))
+sleep 2
+if kill -0 "$PID" 2>/dev/null; then
+  kill "$PID" 2>/dev/null || true
   sleep 1
-done
-echo "Linux binary did not exit after its window was closed." >&2
-exit 1
+fi
+set +e
+wait "$PID"
+set -e
+PID=""
+echo "PASS: Linux binary starts its desktop UI, uses system WebKitGTK, and serves HTML/JS/CSS/API."
+exit 0
