@@ -14,13 +14,6 @@ binaries = []
 hiddenimports = [
     "webview.platforms.gtk",
     "gi",
-    "gi.repository.Gtk",
-    "gi.repository.Gdk",
-    "gi.repository.GLib",
-    "gi.repository.GObject",
-    "gi.repository.Gio",
-    "gi.repository.WebKit2",
-    "gi.repository.cairo",
     "keyring.backends.SecretService",
     "keyring.backends.chainer",
     "keyring.backends.fail",
