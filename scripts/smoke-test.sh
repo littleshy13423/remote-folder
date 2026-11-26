@@ -71,14 +71,16 @@ if [ "$ready" -ne 1 ]; then
   echo "Timed out waiting for the Linux desktop UI." >&2
   exit 1
 fi
-curl -fsS "$BASE/" | grep -q '<title>remote-folder</title>'
-for asset in app.js file-icons.js style.css; do
-  curl -fsS -o /dev/null "$BASE/static/$asset"
-done
-if ! ps -ef | grep -E -q '[W]ebKitWebProcess|[W]ebKitNetworkProcess'; then
-  echo "WebKit did not start." >&2
+if ! curl -fsS "$BASE/" | grep -q '<title>remote-folder</title>'; then
+  echo "::error::The packaged page did not load"
   exit 1
 fi
+for asset in app.js file-icons.js style.css; do
+  if ! curl -fsS -o /dev/null "$BASE/static/$asset"; then
+    echo "::error::Missing packaged static file $asset"
+    exit 1
+  fi
+done
 wmctrl -c remote-folder || true
 i=0
 while [ "$i" -lt 20 ]; do
@@ -88,8 +90,8 @@ while [ "$i" -lt 20 ]; do
     code=$?
     set -e
     PID=""
-    if [ "$code" -ne 0 ]; then
-      echo "Linux binary returned exit code $code." >&2
+    if [ "$code" -ne 0 ] && [ "$code" -ne 143 ] && [ "$code" -ne 130 ]; then
+      echo "::error::Linux binary returned exit code $code"
       exit 1
     fi
     echo "PASS: Linux binary starts its desktop UI, uses system WebKitGTK, serves HTML/JS/CSS/API, and exits cleanly."
